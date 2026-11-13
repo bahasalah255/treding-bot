@@ -1,0 +1,4 @@
+# Install this in the Python environment that can access the MT5 terminal.
+# MetaTrader5 is distributed for Windows; Debian users may need a Windows
+# terminal or a verified Wine setup.
+MetaTrader5>=5.0.45,<6

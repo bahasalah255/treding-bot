@@ -1,0 +1,6 @@
+numpy>=2.0,<3
+pandas>=2.2,<3
+matplotlib>=3.9,<4
+streamlit>=1.38,<2
+PyYAML>=6.0,<7
+pytest>=8.0,<9

@@ -1,0 +1,31 @@
+project:
+  name: xauusd-backtest
+  mode: backtest_only
+  timezone: UTC
+
+market:
+  symbol: XAUUSD
+  main_timeframe: M5
+  confirmation_timeframe: M15
+
+capital:
+  initial_mad: 1000.0
+  risk_per_trade: 0.005
+  max_simultaneous_positions: 1
+  max_daily_loss: 0.02
+  max_total_drawdown: 0.05
+
+costs:
+  spread_points: 0
+  commission_per_lot_mad: 0.0
+  slippage_points: 0
+
+data:
+  required_columns:
+    - timestamp
+    - open
+    - high
+    - low
+    - close
+    - tick_volume
+    - spread
