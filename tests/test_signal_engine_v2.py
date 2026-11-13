@@ -11,7 +11,6 @@ from trading.groq_signal import (
     _confirmed_pivots,
     _market_evidence,
     _redact_diagnostic,
-    _rr_mismatch_diagnostic,
     _validate_frame,
     _validate_setup,
     request_signal,
@@ -283,6 +282,43 @@ def test_local_rejection_preserves_groq_rejection_reasons(monkeypatch):
     assert "1:2" in signal.rejection_reasons[-1]
 
 
+def _permissive_evidence():
+    return {
+        "ema20": 105.0,
+        "ema50": 95.0,
+        "atr14": 10.0,
+        "support": 70.0,
+        "resistance": 130.0,
+        "latest_close": 100.0,
+        "range": {"middle": False},
+        "bos": {"up": False, "down": False},
+        "breakout_retest": {
+            "bullish": {"confirmed": False},
+            "bearish": {"confirmed": False},
+        },
+        "local_buy_score": 40.0,
+        "local_sell_score": 40.0,
+        "local_score_breakdown": {},
+        "as_of": "2026-01-01T00:00:00+00:00",
+    }
+
+
+def _request_with_payload(monkeypatch, payload):
+    text = json.dumps(payload)
+    monkeypatch.setattr(
+        "trading.groq_signal._market_evidence",
+        lambda frame: _permissive_evidence(),
+    )
+    monkeypatch.setattr(
+        "trading.groq_signal.Groq",
+        lambda **kwargs: SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=lambda **options: _groq_response(text)))
+        ),
+    )
+    return request_signal(_frame())
+
+
 @pytest.mark.parametrize(
     ("action", "entry", "stop_loss", "take_profit"),
     [
@@ -290,7 +326,7 @@ def test_local_rejection_preserves_groq_rejection_reasons(monkeypatch):
         ("SELL", 100.0, 110.0, 80.0),
     ],
 )
-def test_rr_mismatch_returns_data_error_with_diagnostics(
+def test_local_rr_is_two_for_buy_and_sell(
     monkeypatch, action, entry, stop_loss, take_profit
 ):
     payload = _valid_payload(action)
@@ -298,90 +334,138 @@ def test_rr_mismatch_returns_data_error_with_diagnostics(
         "entry_price": entry,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
-        "risk_reward": 1.0,
     })
-    text = json.dumps(payload)
-    monkeypatch.setattr(
-        "trading.groq_signal.Groq",
-        lambda **kwargs: SimpleNamespace(
-            chat=SimpleNamespace(
-                completions=SimpleNamespace(create=lambda **options: _groq_response(text)))
-        ),
-    )
 
-    signal = request_signal(_frame())
+    signal = _request_with_payload(monkeypatch, payload)
 
-    assert signal.action == "DATA_ERROR"
-    assert signal.rationale == "Groq risk_reward does not match calculated prices"
-    assert "symbol=XAUUSD" in signal.diagnostic
-    assert f"action={action}" in signal.diagnostic
-    assert "groq_entry=100.0" in signal.diagnostic
-    assert "groq_stop_loss=" in signal.diagnostic
-    assert "groq_take_profit=" in signal.diagnostic
-    assert "groq_risk_reward=1.0" in signal.diagnostic
-    assert "calculated_risk_reward=2.0" in signal.diagnostic
-    assert "absolute_difference=1.0" in signal.diagnostic
-    assert "relative_difference=0.5" in signal.diagnostic
-    assert "rel_tol=0.01" in signal.diagnostic
-    assert "abs_tol=0.01" in signal.diagnostic
+    assert signal.action == action
+    assert signal.risk_reward == 2.0
 
 
-def test_rr_within_tolerance_is_accepted(monkeypatch):
+@pytest.mark.parametrize(
+    ("action", "entry", "stop_loss", "take_profit"),
+    [
+        ("BUY", 100.0, 90.0, 115.0),
+        ("SELL", 100.0, 110.0, 85.0),
+    ],
+)
+def test_local_rr_below_two_is_rejected(
+    monkeypatch, action, entry, stop_loss, take_profit
+):
+    payload = _valid_payload(action)
+    payload.update({
+        "entry_price": entry,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+    })
+
+    signal = _request_with_payload(monkeypatch, payload)
+
+    assert signal.action == "NO_TRADE"
+    assert "1:2" in signal.rejection_reasons[-1]
+
+
+@pytest.mark.parametrize(
+    ("action", "entry", "stop_loss", "take_profit"),
+    [
+        ("BUY", 100.0, 90.0, 130.0),
+        ("SELL", 100.0, 110.0, 70.0),
+    ],
+)
+def test_local_rr_above_two_is_stored(
+    monkeypatch, action, entry, stop_loss, take_profit
+):
+    payload = _valid_payload(action)
+    payload.update({
+        "entry_price": entry,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+    })
+
+    signal = _request_with_payload(monkeypatch, payload)
+
+    assert signal.action == action
+    assert signal.risk_reward == 3.0
+
+
+def test_missing_groq_rr_is_accepted_and_local_rr_is_authoritative(monkeypatch):
+    payload = _valid_payload("BUY")
+    payload.update({"entry_price": 100.0, "stop_loss": 90.0, "take_profit": 120.0})
+    payload.pop("risk_reward")
+
+    signal = _request_with_payload(monkeypatch, payload)
+
+    assert signal.action == "BUY"
+    assert signal.risk_reward == 2.0
+
+
+def test_incorrect_groq_rr_is_ignored(monkeypatch, caplog):
     payload = _valid_payload("BUY")
     payload.update({
         "entry_price": 100.0,
         "stop_loss": 90.0,
         "take_profit": 120.0,
-        "risk_reward": 2.01,
+        "risk_reward": 1.0,
     })
-    text = json.dumps(payload)
-    monkeypatch.setattr(
-        "trading.groq_signal.Groq",
-        lambda **kwargs: SimpleNamespace(
-            chat=SimpleNamespace(
-                completions=SimpleNamespace(create=lambda **options: _groq_response(text)))
-        ),
-    )
 
-    signal = request_signal(_frame())
+    signal = _request_with_payload(monkeypatch, payload)
 
-    assert signal.action != "DATA_ERROR"
+    assert signal.action == "BUY"
+    assert signal.risk_reward == 2.0
+    assert "Groq RR mismatch diagnostics" in caplog.text
 
 
-def test_rr_outside_tolerance_remains_data_error(monkeypatch):
-    payload = _valid_payload("SELL")
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("entry_price", float("nan")),
+        ("stop_loss", float("inf")),
+        ("take_profit", float("-inf")),
+    ],
+)
+def test_non_finite_prices_are_rejected(monkeypatch, field, value):
+    payload = _valid_payload("BUY")
     payload.update({
         "entry_price": 100.0,
-        "stop_loss": 110.0,
-        "take_profit": 80.0,
-        "risk_reward": 2.03,
+        "stop_loss": 90.0,
+        "take_profit": 120.0,
     })
-    text = json.dumps(payload)
-    monkeypatch.setattr(
-        "trading.groq_signal.Groq",
-        lambda **kwargs: SimpleNamespace(
-            chat=SimpleNamespace(
-                completions=SimpleNamespace(create=lambda **options: _groq_response(text)))
-        ),
-    )
+    payload[field] = value
 
-    signal = request_signal(_frame())
+    signal = _request_with_payload(monkeypatch, payload)
 
     assert signal.action == "DATA_ERROR"
-    assert "absolute_difference=0.0299999999999998" in signal.diagnostic
+    assert "must be finite" in signal.rationale
 
 
-def test_rr_mismatch_diagnostic_marks_missing_values():
-    diagnostic = _rr_mismatch_diagnostic(
-        "BUY", None, None, None, None, None, None
-    )
+@pytest.mark.parametrize(
+    ("action", "entry", "stop_loss", "take_profit"),
+    [
+        ("BUY", 100.0, 100.0, 120.0),
+        ("BUY", 100.0, 110.0, 120.0),
+        ("BUY", -1.0, 90.0, 120.0),
+        ("BUY", 100.0, -1.0, 120.0),
+        ("BUY", 100.0, 90.0, -1.0),
+        ("SELL", 100.0, 100.0, 80.0),
+        ("SELL", 100.0, 90.0, 80.0),
+        ("SELL", -1.0, 110.0, 80.0),
+        ("SELL", 100.0, -1.0, 80.0),
+        ("SELL", 100.0, 110.0, -1.0),
+    ],
+)
+def test_invalid_price_direction_or_zero_risk_is_rejected(
+    monkeypatch, action, entry, stop_loss, take_profit
+):
+    payload = _valid_payload(action)
+    payload.update({
+        "entry_price": entry,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+    })
 
-    assert "symbol=XAUUSD" in diagnostic
-    assert "timestamp=unavailable" in diagnostic
-    assert "action=BUY" in diagnostic
-    assert "groq_entry=unavailable" in diagnostic
-    assert "calculated_risk_reward=unavailable" in diagnostic
-    assert "absolute_difference=unavailable" in diagnostic
+    signal = _request_with_payload(monkeypatch, payload)
+
+    assert signal.action == "NO_TRADE"
 
 
 def test_no_trade_preserves_local_scores_and_does_not_call_orders(monkeypatch):

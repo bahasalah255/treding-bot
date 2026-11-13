@@ -543,9 +543,11 @@ def request_signal(frame: pd.DataFrame) -> Signal:
         "Analyze XAUUSD M5 using ONLY this causal evidence from closed candles. "
         "Evaluate BUY and SELL independently. Groq is supplementary and cannot "
         "override local validation. Return JSON only with exactly this schema: "
-        "action, entry_price, stop_loss, take_profit, risk_reward, market_trend, "
+        "action, entry_price, stop_loss, take_profit, market_trend, "
         "market_condition, buy_setup_score, sell_setup_score, rationale, "
         "rejection_reasons. Scores must be numbers from 0 to 100. "
+        "Do not return risk_reward; Python calculates it from the returned "
+        "entry_price, stop_loss, and take_profit. "
         "rejection_reasons MUST ALWAYS be a JSON array of strings. Use [] when "
         "there are no rejection reasons. It must never be a string, null, object, "
         "number array, or omitted. Use NO_TRADE with null prices if neither side "
@@ -570,7 +572,7 @@ def request_signal(frame: pd.DataFrame) -> Signal:
     try:
         payload = json.loads(content[start:end + 1])
         required = {
-            "action", "entry_price", "stop_loss", "take_profit", "risk_reward",
+            "action", "entry_price", "stop_loss", "take_profit",
             "market_trend", "market_condition", "buy_setup_score",
             "sell_setup_score", "rationale", "rejection_reasons",
         }
@@ -608,28 +610,34 @@ def request_signal(frame: pd.DataFrame) -> Signal:
         entry = _finite_number(payload["entry_price"], "entry_price")
         stop_loss = _finite_number(payload["stop_loss"], "stop_loss")
         take_profit = _finite_number(payload["take_profit"], "take_profit")
-        supplied_rr = _finite_number(payload["risk_reward"], "risk_reward")
     except ValueError as exc:
         return _data_error(str(exc))
     calculated_rr = abs(take_profit - entry) / abs(entry - stop_loss) \
         if entry != stop_loss else 0.0
-    if not math.isclose(
-        supplied_rr,
-        calculated_rr,
-        rel_tol=RR_REL_TOLERANCE,
-        abs_tol=RR_ABS_TOLERANCE,
-    ):
-        diagnostic = _rr_mismatch_diagnostic(
-            action,
-            entry,
-            stop_loss,
-            take_profit,
-            supplied_rr,
-            calculated_rr,
-            evidence.get("as_of"),
-        )
-        LOGGER.warning("%s", diagnostic)
-        return _data_error("Groq risk_reward does not match calculated prices", diagnostic)
+    if "risk_reward" in payload and payload["risk_reward"] is not None:
+        try:
+            supplied_rr = _finite_number(payload["risk_reward"], "risk_reward")
+        except ValueError:
+            LOGGER.warning("Ignoring invalid non-authoritative Groq risk_reward")
+        else:
+            if not math.isclose(
+                supplied_rr,
+                calculated_rr,
+                rel_tol=RR_REL_TOLERANCE,
+                abs_tol=RR_ABS_TOLERANCE,
+            ):
+                LOGGER.warning(
+                    "%s",
+                    _rr_mismatch_diagnostic(
+                        action,
+                        entry,
+                        stop_loss,
+                        take_profit,
+                        supplied_rr,
+                        calculated_rr,
+                        evidence.get("as_of"),
+                    ),
+                )
     setup_error = _validate_setup(action, entry, stop_loss, take_profit, evidence)
     if setup_error:
         return _no_trade(setup_error, payload, evidence)
