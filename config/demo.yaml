@@ -1,0 +1,36 @@
+# Runtime settings for the guarded demo bot. Nothing here enables live trading:
+# trading/mt5_demo.py refuses any account that is not a demo account.
+account:
+  # Exact Market Watch symbol name. Confirm it with:
+  #   python -m trading.preflight
+  symbol: XAUUSD
+  # Candle timeframe used for signals: M5, M15, M30, H1.
+  timeframe: M5
+
+execution:
+  magic: 26001
+  # Fraction of account balance risked per trade (0.005 = 0.5%).
+  risk_per_trade: 0.005
+  # Stop opening new trades once this fraction of balance is lost in one UTC day.
+  max_daily_loss: 0.02
+  max_trades_per_day: 3
+  max_open_positions: 1
+  # Skip entries while the spread is wider than this many points.
+  max_spread_points: 60
+  # Reject signals whose reward:risk is below this.
+  min_reward_risk: 1.0
+  deviation_points: 20
+  # null lets the bot pick IOC or FOK from the symbol's supported modes.
+  filling_mode: null
+
+monitor:
+  bars: 500
+  poll_seconds: 60
+  # Give up on a candle after this many model attempts (protects API spend).
+  max_signal_attempts: 2
+  # Doubling backoff after an error, capped here.
+  max_backoff_seconds: 600
+
+model:
+  name: openai/gpt-oss-20b
+  context_bars: 100

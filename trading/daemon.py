@@ -1,69 +1,215 @@
-"""Continuous, guarded Demo monitor for XAUUSD M5."""
+"""Continuous, guarded demo monitor.
+
+Runs one MetaTrader 5 session for its whole lifetime, trades only closed
+candles, journals every decision, and never re-trades a candle after a restart.
+"""
 
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
-import MetaTrader5 as mt5
 import pandas as pd
 
-from trading.groq_signal import request_signal
-from trading.mt5_demo import execute_demo_signal
+from trading.config import DEFAULT_PATH, DemoConfig, load_config
+from trading.journal import Journal
+from trading.state import StateStore, RuntimeState, single_instance
+
+ROOT = Path(__file__).resolve().parents[1]
+LOG_DIR = ROOT / "logs"
+STATE_PATH = LOG_DIR / "state.json"
+LOCK_PATH = LOG_DIR / "bot.lock"
 
 
-def fetch_closed_m5(symbol: str, count: int = 500) -> pd.DataFrame:
-    """Fetch only closed M5 candles from the connected MT5 terminal."""
-    if not mt5.initialize():
-        raise RuntimeError(f"MT5 initialization failed: {mt5.last_error()}")
+def read_closed_bars(terminal: Any, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
+    """Return only fully closed candles, newest last."""
+    attribute = f"TIMEFRAME_{timeframe.upper()}"
+    timeframe_value = getattr(terminal, attribute, None)
+    if timeframe_value is None:
+        raise ValueError(f"unsupported timeframe {timeframe!r}")
+    rates = terminal.copy_rates_from_pos(symbol, timeframe_value, 0, count)
+    if rates is None or len(rates) < 3:
+        raise RuntimeError(f"MT5 returned too few rates: {terminal.last_error()}")
+    # Position 0 is the candle that is still forming, so drop it.
+    frame = pd.DataFrame(rates[:-1])
+    frame["timestamp"] = pd.to_datetime(frame.pop("time"), unit="s", utc=True)
+    return frame.set_index("timestamp").sort_index()
+
+
+def journal_new_deals(
+    terminal: Any, config: DemoConfig, journal: Journal, state: RuntimeState
+) -> None:
+    """Record deals this bot closed since the last poll."""
+    from trading.mt5_demo import new_deals
+
+    for deal in new_deals(terminal, config.execution.magic, state.last_deal_ticket):
+        journal.write(
+            "deal",
+            ticket=int(deal.ticket),
+            position=int(getattr(deal, "position_id", 0)),
+            symbol=str(getattr(deal, "symbol", config.account.symbol)),
+            entry=int(getattr(deal, "entry", 0)),
+            volume=float(getattr(deal, "volume", 0.0)),
+            price=float(getattr(deal, "price", 0.0)),
+            profit=float(getattr(deal, "profit", 0.0)),
+            commission=float(getattr(deal, "commission", 0.0)),
+            swap=float(getattr(deal, "swap", 0.0)),
+            deal_time=datetime.fromtimestamp(
+                int(deal.time), tz=timezone.utc
+            ).isoformat(),
+        )
+        state.last_deal_ticket = int(deal.ticket)
+
+
+def process_candle(
+    terminal: Any,
+    config: DemoConfig,
+    journal: Journal,
+    state: RuntimeState,
+    frame: pd.DataFrame,
+    execute: bool,
+) -> None:
+    """Turn the newest closed candle into at most one demo order."""
+    from trading.groq_signal import request_signal
+    from trading.mt5_demo import ExecutionError, submit_signal
+
+    candle = frame.index[-1].isoformat()
     try:
-        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, count)
-        if rates is None or len(rates) < 20:
-            raise RuntimeError(f"MT5 returned insufficient rates: {mt5.last_error()}")
-        frame = pd.DataFrame(rates[:-1])
-        frame["timestamp"] = pd.to_datetime(frame.pop("time"), unit="s", utc=True)
-        return frame.set_index("timestamp").sort_index()
-    finally:
-        mt5.shutdown()
+        signal = request_signal(
+            frame,
+            model=config.model.name,
+            context_bars=config.model.context_bars,
+        )
+    except Exception as exc:
+        journal.write(
+            "error", stage="signal", candle=candle,
+            error=type(exc).__name__, detail=str(exc),
+            attempt=state.signal_attempts,
+        )
+        return
+
+    journal.write(
+        "signal", candle=candle, action=signal.action,
+        stop_loss=signal.stop_loss, take_profit=signal.take_profit,
+        rationale=signal.rationale,
+    )
+    if signal.action == "NO_TRADE":
+        state.finish_candle(candle)
+        return
+
+    try:
+        result = submit_signal(signal, config, journal, state, terminal, execute=execute)
+    except ExecutionError as exc:
+        journal.write("error", stage="execution", candle=candle, detail=str(exc))
+        state.finish_candle(candle)
+        return
+    journal.write("result", candle=candle, status=result.status, detail=result.detail)
+    state.finish_candle(candle)
 
 
-def run_monitor(symbol: str, interval_seconds: int, once: bool = False) -> None:
-    """Monitor new closed candles until interrupted."""
-    last_processed: pd.Timestamp | None = None
-    print(f"Monitoring {symbol} M5 every {interval_seconds} seconds (Demo only).")
-    while True:
-        try:
-            frame = fetch_closed_m5(symbol)
-            candle_time = frame.index[-1]
-            if candle_time != last_processed:
-                signal = request_signal(frame)
-                print(
-                    f"{datetime.now(timezone.utc).isoformat()} "
-                    f"candle={candle_time.isoformat()} signal={signal}"
+def run(
+    config: DemoConfig,
+    *,
+    once: bool = False,
+    dry_run: bool = False,
+    journal_directory: Path = LOG_DIR,
+) -> None:
+    """Poll the terminal until interrupted."""
+    from trading.mt5_demo import ExecutionError, is_live_trading_enabled, session
+
+    journal = Journal(journal_directory)
+    store = StateStore(journal_directory / "state.json")
+    state = store.load()
+    execute = is_live_trading_enabled() and not dry_run
+
+    with single_instance(journal_directory / "bot.lock"):
+        with session() as terminal:
+            account_note = "demo"
+            journal.write(
+                "startup",
+                symbol=config.account.symbol,
+                timeframe=config.account.timeframe,
+                magic=config.execution.magic,
+                execute=execute,
+                account_mode=account_note,
+                restarted_at=datetime.now(timezone.utc).isoformat(),
+            )
+            if not execute:
+                journal.write(
+                    "notice",
+                    detail="dry run: set ENABLE_DEMO_TRADING=1 to send demo orders",
                 )
-                if signal.action != "NO_TRADE":
-                    print(execute_demo_signal(symbol, signal))
-                last_processed = candle_time
-            else:
-                print(f"No new closed candle: {candle_time.isoformat()}")
-        except Exception as exc:
-            print(f"MONITOR_ERROR: {type(exc).__name__}: {exc}")
-        if once:
-            return
-        time.sleep(interval_seconds)
+
+            failures = 0
+            while True:
+                try:
+                    today = datetime.now(timezone.utc).date().isoformat()
+                    if state.roll_day(today):
+                        store.save(state)
+                    journal_new_deals(terminal, config, journal, state)
+
+                    frame = read_closed_bars(
+                        terminal, config.account.symbol,
+                        config.account.timeframe, config.monitor.bars,
+                    )
+                    candle = frame.index[-1].isoformat()
+                    state.begin_candle(candle)
+
+                    if candle == state.processed_candle:
+                        journal.write("idle", candle=candle, processed=True)
+                    elif state.signal_attempts >= config.monitor.max_signal_attempts:
+                        journal.write(
+                            "abandoned", candle=candle, attempts=state.signal_attempts,
+                        )
+                        state.finish_candle(candle)
+                    else:
+                        state.signal_attempts += 1
+                        store.save(state)
+                        process_candle(
+                            terminal, config, journal, state, frame, execute
+                        )
+                    failures = 0
+                except ExecutionError as exc:
+                    failures += 1
+                    journal.write("error", stage="loop", detail=str(exc))
+                except Exception as exc:  # noqa: BLE001 - the loop must survive
+                    failures += 1
+                    journal.write(
+                        "error", stage="loop", error=type(exc).__name__, detail=str(exc)
+                    )
+                store.save(state)
+
+                if once:
+                    break
+                delay = config.monitor.poll_seconds
+                if failures:
+                    delay = min(
+                        delay * (2**failures), config.monitor.max_backoff_seconds
+                    )
+                time.sleep(delay)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Continuous guarded XAUUSD Demo monitor")
-    parser.add_argument("--symbol", default="XAUUSD")
-    parser.add_argument("--interval", type=int, default=300)
-    parser.add_argument("--once", action="store_true")
-    args = parser.parse_args()
-    if args.interval < 60:
-        raise SystemExit("--interval must be at least 60 seconds")
-    run_monitor(args.symbol, args.interval, args.once)
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Continuous guarded XAUUSD demo monitor")
+    parser.add_argument("--config", default=str(DEFAULT_PATH))
+    parser.add_argument("--once", action="store_true", help="process one candle and exit")
+    parser.add_argument("--dry-run", action="store_true", help="never send orders")
+    args = parser.parse_args(argv)
+
+    try:
+        config = load_config(args.config)
+        run(config, once=args.once, dry_run=args.dry_run)
+    except KeyboardInterrupt:
+        print("Stopped by user.")
+    except Exception as exc:  # noqa: BLE001 - surface a clean message
+        print(f"FATAL: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

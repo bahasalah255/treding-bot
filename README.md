@@ -48,6 +48,36 @@ Before importing data, record its broker, symbol name, date range, timezone,
 export method, and cost assumptions in `data/metadata/`. Broker-specific symbol
 names and contract specifications must not be guessed.
 
+## Backtest signals, costs, and risk limits
+
+`backtest/ema_mtf.py` timestamps bars by their open time, as MT5 exports them.
+An M15 bar that opens at `T` is only used from `T + 15m` onward, so the trend
+filter never sees a bar that had not closed yet.
+
+`backtest/engine.py` charges costs in **price** units, because converting
+points, lots, and currency into price needs broker contract specifications:
+
+- `spread_price` is charged once per round turn.
+- `slippage_price` is charged once per side.
+- `commission_price` is charged once per round turn.
+
+All three are deducted from each trade's result in R. Stops and targets fill at
+the bar open when a bar gaps through them, and the stop is assumed to fill
+first when both levels are touched inside one bar. A position still open on the
+last bar is marked to the final close with the `end_of_data` exit reason
+instead of being dropped.
+
+`max_daily_loss` and `max_total_drawdown` from `config/default.yaml` are
+fractions of balance. The daily limit blocks new entries until the next UTC
+day; the total limit stops the run permanently and is reported as
+`halted_reason`. Both are entry filters, so a trade already open runs to its
+own exit.
+
+`config/default.yaml` maps points to price through `costs.price_per_point`.
+Point-based spread or slippage with `price_per_point` left `null` is rejected
+rather than silently backtested for free, and `commission_per_lot_mad` is
+rejected until contract size and lot value have been recorded.
+
 ## MT5 historical import
 
 The importer only reads account metadata, Market Watch symbols, and historical
