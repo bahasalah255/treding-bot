@@ -10,6 +10,7 @@ from typing import Any, Iterable
 import pandas as pd
 
 from data.validate import validate_frame
+from data.timestamp_validation import normalize_unix_timestamps
 
 try:
     import MetaTrader5 as mt5
@@ -65,7 +66,7 @@ def rates_to_frame(rates: Any) -> pd.DataFrame:
     if missing:
         raise MT5ImportError(f"MT5 response is missing columns: {', '.join(sorted(missing))}")
 
-    frame["timestamp"] = pd.to_datetime(frame.pop("time"), unit="s", utc=True)
+    frame["timestamp"] = normalize_unix_timestamps(frame.pop("time"))
     if "real_volume" not in frame:
         frame["real_volume"] = 0
     frame = frame[list(OUTPUT_COLUMNS)].sort_values("timestamp")
