@@ -8,7 +8,13 @@ from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
-from groq import Groq
+
+try:  # pragma: no cover - optional so tests stay hermetic
+    from groq import Groq
+except ImportError:  # pragma: no cover
+    Groq = None  # type: ignore[assignment]
+
+DEFAULT_MODEL = "openai/gpt-oss-20b"
 
 
 @dataclass(frozen=True)
@@ -155,6 +161,18 @@ def _content(response: object) -> str:
     return str(response.choices[0].message.content or "")
 
 
+def _client(client: Any = None) -> Any:
+    """Return an injected client, or build one from ``GROQ_API_KEY``."""
+    if client is not None:
+        return client
+    if Groq is None:
+        raise RuntimeError("groq is not installed; run: pip install -r requirements.txt")
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is not set")
+    return Groq(api_key=api_key)
+
+
 def _validate_setup(action: str, entry: float, stop_loss: float, take_profit: float,
                     evidence: dict[str, Any]) -> str | None:
     """Reject targets beyond structure unless a confirmed break/retest exists."""
@@ -176,15 +194,9 @@ def _validate_setup(action: str, entry: float, stop_loss: float, take_profit: fl
     return None
 
 
-def request_signal(frame: pd.DataFrame) -> Signal:
-    """Return a structured signal or DATA_ERROR; never return an incomplete trade."""
-    error = _validate_frame(frame)
-    if error:
-        return _data_error(error)
-    evidence = _market_evidence(frame)
-    if evidence["atr14"] is None:
-        return _data_error("not enough candles to calculate ATR14")
-    prompt = (
+def build_prompt(evidence: dict[str, Any]) -> str:
+    """Return the model prompt for one piece of causal market evidence."""
+    return (
         "Analyze XAUUSD using ONLY this causal evidence from closed candles. "
         "Evaluate BUY and SELL independently. Detect HH, HL, LH, LL, consolidation, "
         "range middle, liquidity sweeps, BOS, CHoCH, support/resistance, pullback, "
@@ -197,14 +209,34 @@ def request_signal(frame: pd.DataFrame) -> Signal:
         "Never invent missing data.\n\nEVIDENCE:\n"
         + json.dumps(evidence, separators=(",", ":"))
     )
-    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-    response = client.chat.completions.create(
-        model=os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b"),
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        max_tokens=1200,
-        reasoning_effort="low",
-    )
+
+
+def request_signal(
+    frame: pd.DataFrame,
+    model: str | None = None,
+    context_bars: int = 100,
+    client: Any = None,
+) -> Signal:
+    """Return a structured signal or DATA_ERROR; never return an incomplete trade."""
+    error = _validate_frame(frame)
+    if error:
+        return _data_error(error)
+    if context_bars and context_bars > 0:
+        frame = frame.tail(max(context_bars, 60))
+    evidence = _market_evidence(frame)
+    if evidence["atr14"] is None:
+        return _data_error("not enough candles to calculate ATR14")
+    try:
+        groq_client = _client(client)
+        response = groq_client.chat.completions.create(
+            model=model or os.environ.get("GROQ_MODEL", DEFAULT_MODEL),
+            messages=[{"role": "user", "content": build_prompt(evidence)}],
+            temperature=0,
+            max_tokens=1200,
+            response_format={"type": "json_object"},
+        )
+    except Exception as exc:  # noqa: BLE001 - never trade on a failed request
+        return _data_error(f"Groq request failed: {type(exc).__name__}: {exc}")
     content = _content(response)
     start, end = content.find("{"), content.rfind("}")
     if start < 0 or end <= start:

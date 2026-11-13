@@ -1,8 +1,8 @@
 # XAUUSD Automated Trading Bot
 
-This project is being developed incrementally for historical XAUUSD backtesting.
-The initial stage is strictly backtest-only. It does not connect to MetaTrader 5
-accounts and does not submit orders.
+This project is being developed incrementally for historical XAUUSD backtesting
+and a **guarded demo-only** execution path. Execution is disabled by default and
+refuses any account that is not a MetaTrader 5 demo account.
 
 ## Phase 1 status
 
@@ -47,6 +47,36 @@ volume or spread values.
 Before importing data, record its broker, symbol name, date range, timezone,
 export method, and cost assumptions in `data/metadata/`. Broker-specific symbol
 names and contract specifications must not be guessed.
+
+## Backtest signals, costs, and risk limits
+
+`backtest/ema_mtf.py` timestamps bars by their open time, as MT5 exports them.
+An M15 bar that opens at `T` is only used from `T + 15m` onward, so the trend
+filter never sees a bar that had not closed yet.
+
+`backtest/engine.py` charges costs in **price** units, because converting
+points, lots, and currency into price needs broker contract specifications:
+
+- `spread_price` is charged once per round turn.
+- `slippage_price` is charged once per side.
+- `commission_price` is charged once per round turn.
+
+All three are deducted from each trade's result in R. Stops and targets fill at
+the bar open when a bar gaps through them, and the stop is assumed to fill
+first when both levels are touched inside one bar. A position still open on the
+last bar is marked to the final close with the `end_of_data` exit reason
+instead of being dropped.
+
+`max_daily_loss` and `max_total_drawdown` from `config/default.yaml` are
+fractions of balance. The daily limit blocks new entries until the next UTC
+day; the total limit stops the run permanently and is reported as
+`halted_reason`. Both are entry filters, so a trade already open runs to its
+own exit.
+
+`config/default.yaml` maps points to price through `costs.price_per_point`.
+Point-based spread or slippage with `price_per_point` left `null` is rejected
+rather than silently backtested for free, and `commission_per_lot_mad` is
+rejected until contract size and lot value have been recorded.
 
 ## MT5 historical import
 
@@ -99,8 +129,77 @@ contain trade or order functions. Files are written to MT5's Common Files
 folder; copy the generated `xauusd_M5.csv` and `xauusd_M15.csv` files into
 `data/raw/` on Debian for validation and backtesting.
 
+## Guarded demo runtime (Windows + MetaTrader 5)
+
+`trading/` contains a demo-only monitor. It never trades a real account: the
+account `trade_mode` must equal `ACCOUNT_TRADE_MODE_DEMO`, and execution also
+requires the explicit `ENABLE_DEMO_TRADING=1` switch.
+
+Install the optional dependencies in the environment that can reach the
+terminal:
+
+```powershell
+pip install -r requirements-mt5.txt
+pip install "groq>=0.30,<1"
+$env:GROQ_API_KEY = "..."
+```
+
+In MetaTrader 5, connect the demo account, add `XAUUSD` to Market Watch, and
+click **Algo Trading** in the toolbar so it turns green.
+
+Read-only checks first (this never sends an order):
+
+```powershell
+python -m trading.preflight
+```
+
+`preflight` reports the account, symbol contract, spread, broker minimum stop
+distance, the sizing source, and whether Algo Trading and `GROQ_API_KEY` are
+ready. It deliberately fails while Algo Trading is off.
+
+Process one closed candle without sending anything:
+
+```powershell
+python -m trading.daemon --once --dry-run
+```
+
+Run continuously on the demo account:
+
+```powershell
+$env:ENABLE_DEMO_TRADING = "1"
+python -m trading.daemon
+```
+
+Inspect decisions and realized P&L at any time:
+
+```powershell
+python -m trading.report
+```
+
+Panic switch — preview, then close only this bot's positions:
+
+```powershell
+python -m trading.close_all
+python -m trading.close_all --yes
+```
+
+Runtime settings live in `config/demo.yaml`. Safety properties:
+
+- Only fully closed candles are used; future, duplicate, out-of-order, and naive
+  timestamps are rejected by `data/timestamp_validation.py`.
+- Orders are sized from the terminal's own `order_calc_profit`, not from
+  `trade_tick_value` (some brokers report it 10x too small).
+- Entries are skipped when the spread is too wide, a position is already open,
+  the daily trade cap is reached, or the daily loss limit is hit.
+- Signals must pass direction, broker stop distance, and reward:risk checks.
+- Every signal, block, error, and order is appended to `logs/journal-YYYY-MM-DD.jsonl`.
+- `logs/state.json` means a restart never re-trades the same candle, and a
+  single-instance lock prevents two daemons on one account.
+- The bot only ever manages positions carrying its own `magic` number.
+
 ## Safety boundary
 
-Do not add account credentials or enable execution until historical validation,
-backtesting, out-of-sample testing, and explicit manual authorization have been
-completed.
+Keep execution on a demo account. Real-money trading is out of scope: the
+executor refuses any non-demo `trade_mode`, and execution is disabled unless
+`ENABLE_DEMO_TRADING=1` is set deliberately. Do not add credentials for a live
+account, and re-run the backtest and a dry-run pass after every strategy change.

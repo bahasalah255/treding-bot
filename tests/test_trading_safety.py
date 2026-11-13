@@ -2,13 +2,21 @@ from types import SimpleNamespace
 
 import pytest
 
-from trading.groq_signal import _validate_setup, classify_structure
+from trading.groq_signal import Signal, _validate_setup, classify_structure
 from trading.mt5_demo import (
-    PositionSizingError,
-    calculate_volume_for_risk,
-    execute_demo_signal,
+    ExecutionError,
+    _validate_market_levels,
+    loss_per_lot,
+    require_demo_account,
 )
-from trading.groq_signal import Signal
+from trading.risk import SymbolSpec, volume_for_risk
+
+SPEC = SymbolSpec(
+    point=0.01,
+    volume_min=0.01,
+    volume_max=100.0,
+    volume_step=0.01,
+)
 
 
 def _symbol(**overrides):
@@ -30,84 +38,83 @@ def _symbol(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_position_sizing_uses_monetary_risk_and_cap():
-    volume, estimated_risk = calculate_volume_for_risk(
-        _symbol(), entry=3878.36, stop_loss=3885.0, equity=99528.73,
-        risk_percent=0.5, max_volume=1.0
+def _account(**overrides):
+    values = {
+        "login": 10013615454,
+        "server": "MetaQuotes-Demo",
+        "currency": "USD",
+        "balance": 1000.0,
+        "equity": 1000.0,
+        "trade_mode": 0,
+        "trade_expert": True,
+        "leverage": 100,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _terminal(**overrides):
+    values = {
+        "ACCOUNT_TRADE_MODE_DEMO": 0,
+        "ORDER_TYPE_BUY": 0,
+        "SYMBOL_TRADE_MODE_DISABLED": 0,
+        "account_info": lambda: _account(),
+        "symbol_info": lambda symbol: _symbol(),
+        "order_calc_profit": lambda *args: -664.0,
+        "last_error": lambda: (0, "ok"),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_sizing_uses_order_calc_profit_instead_of_stale_tick_fields():
+    # The broker reports trade_tick_value=0.1, implying 66.4 per lot over a
+    # 6.64 move, but its own order_calc_profit says 664.0. The larger, broker
+    # authoritative value must win or the bot would size 10x too large.
+    per_lot, tick_estimate = loss_per_lot(
+        _terminal(), "XAUUSD", entry=3885.0, stop_loss=3878.36, spec=SPEC
     )
-    assert volume == 1.0
-    assert estimated_risk == pytest.approx(66.4)
+
+    assert per_lot == pytest.approx(664.0)
+    assert tick_estimate == pytest.approx(66.4)
+    volume = volume_for_risk(100_000.0, 0.005, per_lot, SPEC)
+    assert volume == pytest.approx(0.75)
 
 
-def test_position_sizing_rejects_missing_specification():
-    with pytest.raises(PositionSizingError, match="trade_tick_size"):
-        calculate_volume_for_risk(
-            _symbol(trade_tick_size=0), 100, 99, 1000
-        )
+def test_sizing_falls_back_to_contract_size_when_profit_calc_is_unavailable():
+    terminal = _terminal(order_calc_profit=lambda *args: None)
+
+    per_lot, _ = loss_per_lot(terminal, "XAUUSD", 3885.0, 3878.36, SPEC)
+
+    assert per_lot == pytest.approx(6.64 * 100)
 
 
-def test_position_sizing_rejects_minimum_volume_above_risk():
-    with pytest.raises(PositionSizingError, match="minimum broker volume"):
-        calculate_volume_for_risk(
-            _symbol(volume_min=1.0), 100, 99, 100, risk_percent=0.01, max_volume=1
-        )
+def test_require_demo_account_refuses_a_real_account():
+    terminal = _terminal(account_info=lambda: _account(trade_mode=2))
+
+    with pytest.raises(ExecutionError, match="not a demo account"):
+        require_demo_account(terminal)
+
+
+def test_require_demo_account_refuses_a_disabled_expert():
+    terminal = _terminal(account_info=lambda: _account(trade_expert=False))
+
+    with pytest.raises(ExecutionError, match="algo trading is disabled"):
+        require_demo_account(terminal)
+
+
+def test_require_demo_account_accepts_demo_and_reports_identity():
+    snapshot = require_demo_account(_terminal())
+
+    assert snapshot.login == 10013615454
+    assert snapshot.server == "MetaQuotes-Demo"
+    assert snapshot.balance == pytest.approx(1000.0)
 
 
 def test_structure_labels_are_standard():
     assert classify_structure([100, 110], [90, 95]) == ("HH", "HL")
     assert classify_structure([110, 100], [95, 90]) == ("LH", "LL")
     assert classify_structure([100, 90], [90, 95]) == ("LH", "HL")
-
-
-def test_autotrading_disabled_is_blocked(monkeypatch):
-    signal = Signal(
-        "SELL", 3878.36, 3885.0, 3865.0, 2.0, "BEARISH", "BREAKDOWN",
-        0.0, 8.0, "test", ()
-    )
-    monkeypatch.setenv("ENABLE_DEMO_TRADING", "1")
-    monkeypatch.setattr("trading.mt5_demo.mt5.initialize", lambda: True)
-    monkeypatch.setattr(
-        "trading.mt5_demo.mt5.terminal_info",
-        lambda: SimpleNamespace(trade_allowed=False),
-    )
-    monkeypatch.setattr(
-        "trading.mt5_demo.mt5.account_info",
-        lambda: SimpleNamespace(trade_allowed=True, trade_mode=0, equity=1000),
-    )
-    monkeypatch.setattr("trading.mt5_demo.mt5.shutdown", lambda: None)
-    result = execute_demo_signal("XAUUSD", signal)
-    assert "AutoTrading disabled" in result
-
-
-def test_failed_order_check_blocks_order(monkeypatch):
-    signal = Signal(
-        "SELL", 3878.36, 3885.0, 3865.0, 2.0, "BEARISH", "BREAKDOWN",
-        0.0, 8.0, "test", ()
-    )
-    monkeypatch.setenv("ENABLE_DEMO_TRADING", "1")
-    monkeypatch.setattr("trading.mt5_demo.mt5.initialize", lambda: True)
-    monkeypatch.setattr(
-        "trading.mt5_demo.mt5.terminal_info",
-        lambda: SimpleNamespace(trade_allowed=True),
-    )
-    monkeypatch.setattr(
-        "trading.mt5_demo.mt5.account_info",
-        lambda: SimpleNamespace(trade_allowed=True, trade_mode=0, equity=100000),
-    )
-    monkeypatch.setattr("trading.mt5_demo.mt5.positions_get", lambda symbol: [])
-    monkeypatch.setattr("trading.mt5_demo.mt5.symbol_info", lambda symbol: _symbol())
-    monkeypatch.setattr(
-        "trading.mt5_demo.mt5.symbol_info_tick",
-        lambda symbol: SimpleNamespace(bid=3878.36, ask=3878.46),
-    )
-    monkeypatch.setattr("trading.mt5_demo.mt5.symbol_select", lambda symbol, value: True)
-    monkeypatch.setattr(
-        "trading.mt5_demo.mt5.order_check",
-        lambda request: SimpleNamespace(retcode=10016, comment="invalid stops"),
-    )
-    monkeypatch.setattr("trading.mt5_demo.mt5.shutdown", lambda: None)
-    result = execute_demo_signal("XAUUSD", signal)
-    assert "order_check failed" in result
 
 
 def test_sell_target_below_support_requires_breakdown_retest():
@@ -122,9 +129,25 @@ def test_sell_target_below_support_requires_breakdown_retest():
 
 
 def test_buy_and_sell_level_direction_is_checked():
-    from trading.mt5_demo import _validate_market_levels
-
     info = _symbol()
     assert _validate_market_levels(info, "BUY", 100, 99, 101) is None
     assert _validate_market_levels(info, "SELL", 100, 101, 99) is None
     assert _validate_market_levels(info, "SELL", 100, 99, 101) is not None
+
+
+def test_freeze_level_is_honoured_as_a_minimum_distance():
+    info = _symbol(trade_freeze_level=25)
+
+    assert _validate_market_levels(info, "BUY", 100.0, 99.9, 101.0) is not None
+    assert _validate_market_levels(info, "BUY", 100.0, 99.7, 100.3) is None
+
+
+def test_signal_from_groq_carries_structure_context():
+    signal = Signal(
+        "SELL", 3878.36, 3885.0, 3865.0, 2.0, "BEARISH", "BREAKDOWN",
+        0.0, 8.0, "test", (),
+    )
+
+    assert signal.action == "SELL"
+    assert signal.risk_reward == pytest.approx(2.0)
+    assert signal.rejection_reasons == ()
