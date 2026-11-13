@@ -1,0 +1,1 @@
+"""Guarded demo-trading components."""
