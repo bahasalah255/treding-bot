@@ -104,3 +104,20 @@ folder; copy the generated `xauusd_M5.csv` and `xauusd_M15.csv` files into
 Do not add account credentials or enable execution until historical validation,
 backtesting, out-of-sample testing, and explicit manual authorization have been
 completed.
+
+## Demo execution safeguards
+
+The execution module remains disabled unless `ENABLE_DEMO_TRADING=1` is set
+explicitly. Before submitting an order it verifies the Demo account, existing
+positions, broker-supported filling mode, current spread, stop distances, and
+configured risk limits. Approved Demo execution uses
+`DEMO_VOLUME_MODE=fixed` and `DEMO_FIXED_VOLUME=0.02`; the exact volume must
+pass broker minimum, maximum, step, and precision validation. The defaults are
+`MAX_DEMO_SPREAD=0.50` price units and `MAX_DEMO_DEVIATION_POINTS=20`; both
+can be overridden with environment variables. Pending execution state is persisted in
+`logs\pending_executions.sqlite3` and expires after 300 seconds by default
+(`DEMO_PENDING_STATE_PATH` and `PENDING_EXECUTION_TIMEOUT_SECONDS` override
+these settings). Expired uncertain orders are never resubmitted and require
+manual reconciliation. After submission, an order is reported as filled only when a position
+or MT5 order/deal history provides execution evidence. A successful MT5 return
+without evidence is reported as `EXECUTION_UNCONFIRMED`.
