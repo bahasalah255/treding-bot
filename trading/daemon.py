@@ -1,7 +1,8 @@
 """Continuous, guarded demo monitor.
 
 Runs one MetaTrader 5 session for its whole lifetime, trades only closed
-candles, journals every decision, and never re-trades a candle after a restart.
+candles, journals every decision, reconciles ambiguous submissions, and never
+re-trades a candle after a restart.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ import pandas as pd
 from data.timestamp_validation import TimestampValidationError, select_closed_m5_candles
 from trading.config import DEFAULT_PATH, DemoConfig, TIMEFRAMES, load_config
 from trading.journal import Journal
+from trading.monitor_log import append_monitor_log
 from trading.state import StateStore, RuntimeState, single_instance
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +35,32 @@ def timeframe_minutes(timeframe: str) -> int:
         return TIMEFRAMES[timeframe.upper()]
     except KeyError as exc:
         raise ValueError(f"unsupported timeframe {timeframe!r}") from exc
+
+
+def monitor_path(config: DemoConfig) -> Path:
+    """Resolve the CSV diagnostics log path against the repository root."""
+    path = Path(config.monitor.csv_log)
+    return path if path.is_absolute() else ROOT / path
+
+
+def log_monitor(
+    config: DemoConfig,
+    event: str,
+    status: str,
+    values: dict[str, Any] | None = None,
+) -> None:
+    """Write a CSV diagnostics row; a logging failure must not stop trading."""
+    try:
+        append_monitor_log(
+            monitor_path(config),
+            symbol=config.account.symbol,
+            timeframe=config.account.timeframe,
+            event=event,
+            status=status,
+            values=values,
+        )
+    except OSError as exc:
+        print(f"CSV_LOG_ERROR: {type(exc).__name__}: {exc}")
 
 
 def read_closed_bars(terminal: Any, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
@@ -92,29 +120,80 @@ def process_candle(
     from trading.mt5_demo import ExecutionError, submit_signal
 
     candle = frame.index[-1].isoformat()
+    close_time = (
+        frame.index[-1] + timedelta(minutes=timeframe_minutes(config.account.timeframe))
+    ).isoformat()
     try:
         signal = request_signal(
             frame,
             model=config.model.name,
             context_bars=config.model.context_bars,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - the loop must survive
         journal.write(
-            "error", stage="signal", candle=candle,
-            error=type(exc).__name__, detail=str(exc),
+            "error",
+            stage="signal",
+            candle=candle,
+            error=type(exc).__name__,
+            detail=str(exc),
             attempt=state.signal_attempts,
+        )
+        log_monitor(
+            config,
+            "signal",
+            "ERROR",
+            {"candle_open": candle, "candle_close": close_time,
+             "error": f"{type(exc).__name__}: {exc}"},
         )
         return
 
     journal.write(
-        "signal", candle=candle, action=signal.action,
-        entry_price=signal.entry_price, stop_loss=signal.stop_loss,
-        take_profit=signal.take_profit, risk_reward=signal.risk_reward,
-        market_trend=signal.market_trend, market_condition=signal.market_condition,
+        "signal",
+        candle=candle,
+        action=signal.action,
+        entry_price=signal.entry_price,
+        stop_loss=signal.stop_loss,
+        take_profit=signal.take_profit,
+        risk_reward=signal.risk_reward,
+        market_trend=signal.market_trend,
+        market_condition=signal.market_condition,
+        buy_setup_score=signal.buy_setup_score,
+        sell_setup_score=signal.sell_setup_score,
+        local_buy_score=signal.local_buy_score,
+        local_sell_score=signal.local_sell_score,
+        local_score_breakdown=signal.local_score_breakdown,
         rejection_reasons=list(signal.rejection_reasons),
         rationale=signal.rationale,
+        diagnostic=signal.diagnostic,
+        timeframe=config.account.timeframe,
     )
     if signal.action in {"NO_TRADE", "DATA_ERROR"}:
+        log_monitor(
+            config,
+            "signal",
+            "COMPLETE",
+            {
+                "current_utc": datetime.now(timezone.utc).isoformat(),
+                "candle_open": candle,
+                "candle_close": close_time,
+                "latest_closed_candle": candle,
+                "action": signal.action,
+                "entry_price": signal.entry_price,
+                "stop_loss": signal.stop_loss,
+                "take_profit": signal.take_profit,
+                "risk_reward": signal.risk_reward,
+                "market_trend": signal.market_trend,
+                "market_condition": signal.market_condition,
+                "buy_setup_score": signal.buy_setup_score,
+                "sell_setup_score": signal.sell_setup_score,
+                "local_buy_score": signal.local_buy_score,
+                "local_sell_score": signal.local_sell_score,
+                "local_score_breakdown": signal.local_score_breakdown,
+                "rationale": signal.rationale,
+                "rejection_reasons": signal.rejection_reasons,
+                "error": signal.diagnostic or "",
+            },
+        )
         state.finish_candle(candle)
         return
 
@@ -122,9 +201,27 @@ def process_candle(
         result = submit_signal(signal, config, journal, state, terminal, execute=execute)
     except ExecutionError as exc:
         journal.write("error", stage="execution", candle=candle, detail=str(exc))
+        log_monitor(
+            config, "execution", "ERROR", {"candle_open": candle, "error": str(exc)}
+        )
         state.finish_candle(candle)
         return
     journal.write("result", candle=candle, status=result.status, detail=result.detail)
+    log_monitor(
+        config,
+        "execution",
+        result.status.upper(),
+        {
+            "candle_open": candle,
+            "action": signal.action,
+            "entry_price": signal.entry_price,
+            "stop_loss": signal.stop_loss,
+            "take_profit": signal.take_profit,
+            "risk_reward": signal.risk_reward,
+            "execution_status": result.status,
+            "error": result.detail if result.status == "blocked" else "",
+        },
+    )
     state.finish_candle(candle)
 
 
@@ -136,7 +233,13 @@ def run(
     journal_directory: Path = LOG_DIR,
 ) -> None:
     """Poll the terminal until interrupted."""
-    from trading.mt5_demo import ExecutionError, is_live_trading_enabled, require_demo_account, session
+    from trading.mt5_demo import (
+        ExecutionError,
+        is_live_trading_enabled,
+        reconcile_pending,
+        require_demo_account,
+        session,
+    )
 
     journal = Journal(journal_directory)
     store = StateStore(journal_directory / "state.json")
@@ -153,6 +256,7 @@ def run(
                 timeframe=config.account.timeframe,
                 magic=config.execution.magic,
                 execute=execute,
+                volume_mode=config.execution.volume_mode,
                 login=account.login,
                 server=account.server,
                 balance=account.balance,
@@ -174,18 +278,36 @@ def run(
                         store.save(state)
                     journal_new_deals(terminal, config, journal, state)
 
+                    reconciliation = reconcile_pending(terminal, config, journal)
+                    if reconciliation:
+                        journal.write("result", stage="reconciliation", detail=reconciliation)
+
                     frame = read_closed_bars(
-                        terminal, config.account.symbol,
-                        config.account.timeframe, config.monitor.bars,
+                        terminal,
+                        config.account.symbol,
+                        config.account.timeframe,
+                        config.monitor.bars,
                     )
                     candle = frame.index[-1].isoformat()
                     state.begin_candle(candle)
 
                     if candle == state.processed_candle:
                         journal.write("idle", candle=candle, processed=True)
+                        log_monitor(
+                            config,
+                            "heartbeat",
+                            "NO_NEW_CANDLE",
+                            {
+                                "current_utc": datetime.now(timezone.utc).isoformat(),
+                                "candle_open": candle,
+                                "latest_closed_candle": candle,
+                            },
+                        )
                     elif state.signal_attempts >= config.monitor.max_signal_attempts:
                         journal.write(
-                            "abandoned", candle=candle, attempts=state.signal_attempts,
+                            "abandoned",
+                            candle=candle,
+                            attempts=state.signal_attempts,
                         )
                         state.finish_candle(candle)
                     else:
@@ -198,12 +320,32 @@ def run(
                 except (TimestampValidationError, ExecutionError) as exc:
                     failures += 1
                     journal.write(
-                        "error", stage="loop", error=type(exc).__name__, detail=str(exc)
+                        "error",
+                        stage="loop",
+                        error=type(exc).__name__,
+                        detail=str(exc),
+                    )
+                    log_monitor(
+                        config,
+                        "loop",
+                        "ERROR",
+                        {"current_utc": datetime.now(timezone.utc).isoformat(),
+                         "error": f"{type(exc).__name__}: {exc}"},
                     )
                 except Exception as exc:  # noqa: BLE001 - the loop must survive
                     failures += 1
                     journal.write(
-                        "error", stage="loop", error=type(exc).__name__, detail=str(exc)
+                        "error",
+                        stage="loop",
+                        error=type(exc).__name__,
+                        detail=str(exc),
+                    )
+                    log_monitor(
+                        config,
+                        "loop",
+                        "ERROR",
+                        {"current_utc": datetime.now(timezone.utc).isoformat(),
+                         "error": f"{type(exc).__name__}: {exc}"},
                     )
                 store.save(state)
 

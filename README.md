@@ -196,6 +196,13 @@ Runtime settings live in `config/demo.yaml`. Safety properties:
 - `logs/state.json` means a restart never re-trades the same candle, and a
   single-instance lock prevents two daemons on one account.
 - The bot only ever manages positions carrying its own `magic` number.
+- A submitted order is only reported as filled when a matching position or
+  MT5 order/deal history provides execution evidence. Ambiguous submissions are
+  persisted in `logs/pending_executions.sqlite3` and reconciled on later cycles;
+  they are never silently resubmitted, and an expired one requires manual
+  reconciliation.
+- `logs/monitoring.csv` records closed-candle diagnostics separately from the
+  JSONL decision journal.
 
 ## Safety boundary
 

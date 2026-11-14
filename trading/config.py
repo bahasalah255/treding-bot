@@ -10,6 +10,7 @@ import yaml
 
 DEFAULT_PATH = Path(__file__).resolve().parents[1] / "config" / "demo.yaml"
 FILLING_MODES = {"ioc", "fok", "return"}
+VOLUME_MODES = {"risk", "fixed"}
 # Configured timeframe name -> candle size in minutes.
 TIMEFRAMES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240}
 
@@ -36,6 +37,11 @@ class ExecutionConfig:
     deviation_points: int
     filling_mode: str | None
     max_volume: float
+    volume_mode: str = "risk"
+    fixed_volume: float = 0.02
+    max_risk_amount: float | None = None
+    pending_state_path: str = "logs/pending_executions.sqlite3"
+    pending_timeout_seconds: int = 300
 
 
 @dataclass(frozen=True)
@@ -44,6 +50,7 @@ class MonitorConfig:
     poll_seconds: int
     max_signal_attempts: int
     max_backoff_seconds: int
+    csv_log: str = "logs/monitoring.csv"
 
 
 @dataclass(frozen=True)
@@ -120,6 +127,48 @@ def parse_config(config: dict[str, Any]) -> DemoConfig:
     if max_volume <= 0:
         raise ConfigError("execution.max_volume must be positive")
 
+    volume_mode = execution.get("volume_mode", "risk")
+    if not isinstance(volume_mode, str) or volume_mode.strip().lower() not in VOLUME_MODES:
+        raise ConfigError(
+            f"execution.volume_mode must be one of {sorted(VOLUME_MODES)}"
+        )
+    volume_mode = volume_mode.strip().lower()
+
+    fixed_volume = execution.get("fixed_volume", 0.02)
+    if isinstance(fixed_volume, bool) or not isinstance(fixed_volume, (int, float)):
+        raise ConfigError("execution.fixed_volume must be a number")
+    fixed_volume = float(fixed_volume)
+    if fixed_volume <= 0:
+        raise ConfigError("execution.fixed_volume must be positive")
+
+    max_risk_amount = execution.get("max_risk_amount")
+    if max_risk_amount is not None:
+        if isinstance(max_risk_amount, bool) or not isinstance(
+            max_risk_amount, (int, float)
+        ):
+            raise ConfigError("execution.max_risk_amount must be a number or null")
+        max_risk_amount = float(max_risk_amount)
+        if max_risk_amount <= 0:
+            raise ConfigError("execution.max_risk_amount must be positive or null")
+
+    pending_state_path = execution.get(
+        "pending_state_path", "logs/pending_executions.sqlite3"
+    )
+    if not isinstance(pending_state_path, str) or not pending_state_path.strip():
+        raise ConfigError("execution.pending_state_path must be a non-empty string")
+
+    pending_timeout_seconds = execution.get("pending_timeout_seconds", 300)
+    if isinstance(pending_timeout_seconds, bool) or not isinstance(
+        pending_timeout_seconds, int
+    ):
+        raise ConfigError("execution.pending_timeout_seconds must be an integer")
+    if pending_timeout_seconds <= 0:
+        raise ConfigError("execution.pending_timeout_seconds must be positive")
+
+    csv_log = monitor.get("csv_log", "logs/monitoring.csv")
+    if not isinstance(csv_log, str) or not csv_log.strip():
+        raise ConfigError("monitor.csv_log must be a non-empty string")
+
     model = _section(config, "model")
     name = model.get("name")
     if not isinstance(name, str) or not name.strip():
@@ -138,12 +187,18 @@ def parse_config(config: dict[str, Any]) -> DemoConfig:
             deviation_points=_integer(execution, "deviation_points", "execution"),
             filling_mode=filling_mode,
             max_volume=max_volume,
+            volume_mode=volume_mode,
+            fixed_volume=fixed_volume,
+            max_risk_amount=max_risk_amount,
+            pending_state_path=pending_state_path.strip(),
+            pending_timeout_seconds=pending_timeout_seconds,
         ),
         monitor=MonitorConfig(
             bars=_integer(monitor, "bars", "monitor"),
             poll_seconds=poll_seconds,
             max_signal_attempts=_integer(monitor, "max_signal_attempts", "monitor"),
             max_backoff_seconds=_integer(monitor, "max_backoff_seconds", "monitor"),
+            csv_log=csv_log.strip(),
         ),
         model=ModelConfig(
             name=name.strip(),

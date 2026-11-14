@@ -33,6 +33,18 @@ costs:
   commission_per_lot_mad: 0.0
   slippage_points: 0
 
+execution:
+  # Live Demo execution remains disabled unless explicitly enabled by environment.
+  enable_demo_trading: false
+  volume_mode: fixed
+  fixed_volume: 0.02
+  max_risk_amount: null
+  max_spread_price: 0.50
+  max_deviation_points: 20
+  max_connect_attempts: 2
+  pending_state_path: logs\pending_executions.sqlite3
+  pending_timeout_seconds: 300
+
 data:
   required_columns:
     - timestamp
