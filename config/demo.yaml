@@ -9,35 +9,41 @@ account:
 
 execution:
   magic: 26001
-  # Fraction of account balance risked per trade (0.005 = 0.5%).
+  # Fraction of account balance risked per trade when volume_mode is "risk".
   risk_per_trade: 0.005
   # Stop opening new trades once this fraction of balance is lost in one UTC day.
   max_daily_loss: 0.02
-  max_trades_per_day: 3
   max_open_positions: 1
   # Skip entries while the spread is wider than this many points.
   max_spread_points: 60
   deviation_points: 20
   # Hard cap on lot size, independent of the risk-based calculation.
   max_volume: 1.0
-  # Risk sizing is disabled by default; the entry gate owns the fixed volume.
+  # The entry gate owns the dollar risk limits, so on demo the volume is fixed.
+  # "risk" is still available and sizes from order_calc_profit.
   volume_mode: fixed
-  fixed_volume: 0.01
   # Optional absolute loss cap per trade in account currency (null = only the
   # risk fraction above applies).
   max_risk_amount: null
   # Ambiguous submissions are persisted here so a restart never resends them.
   pending_state_path: logs/pending_executions.sqlite3
-  pending_timeout_seconds: 300
+  # Longer than one M5 cycle: the daemon reconciles once per closed candle.
+  pending_timeout_seconds: 900
   # null lets the bot pick IOC or FOK from the symbol's supported modes.
   filling_mode: null
 
 gate:
-  min_score: 70
+  # Local scores are quantised (0/20/40/60/80/100), so 60 is the first
+  # threshold a real setup can clear; 70 behaves like 80 and passes ~2% of
+  # candles, 60 passes ~17%. Measured on 1,481 M5 XAUUSD candles.
+  min_score: 60
+  # The winning side must be clearly ahead of the other side.
   min_score_gap: 30
   sl_atr_mult: 1.5
   min_rr: 2.0
-  fixed_volume: 0.01
+  # 0.05 lots ~= 30 USD risk at a 1.5xATR stop on XAUUSD, which fits inside
+  # the 100 USD daily and 500 USD total caps below.
+  fixed_volume: 0.05
   max_daily_loss_usd: 100.0
   max_consecutive_losses: 2
   max_trades_per_day: 3
@@ -45,7 +51,8 @@ gate:
   session_enabled: false
   session_utc_start: "00:00"
   session_utc_end: "23:59"
-  max_spread: 0.50
+  # Spread limit in points, matching execution.max_spread_points.
+  max_spread_points: 60
 
 monitor:
   bars: 500

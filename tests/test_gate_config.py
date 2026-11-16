@@ -14,7 +14,7 @@ from trading.gate_config import (
 CONFIG = GateConfig(
     max_daily_loss_usd=100,
     max_total_loss_usd=500,
-    max_spread=0.5,
+    max_spread_points=60,
     session_enabled=True,
     session_utc_start="09:00",
     session_utc_end="17:00",
@@ -34,7 +34,7 @@ def signal(**overrides):
 
 def market(**overrides):
     values = {
-        "spread": 0.2,
+        "spread_points": 20,
         "utc_now": datetime(2026, 11, 16, 10, tzinfo=timezone.utc),
         "candle_id": "c1",
         "local_direction": "BUY",
@@ -62,7 +62,7 @@ def test_entry_gate_accepts_a_valid_signal():
         ({"risk_reward": 1.99}, {}, {}, "risk_reward"),
         ({}, {"local_direction": "SELL"}, {}, "direction"),
         ({}, {"utc_now": datetime(2026, 11, 16, 20, tzinfo=timezone.utc)}, {}, "outside"),
-        ({}, {"spread": 0.51}, {}, "spread"),
+        ({}, {"spread_points": 61}, {}, "spread"),
         ({}, {}, {"daily_loss_usd": 100}, "max_daily_loss_usd"),
         ({}, {}, {"consecutive_losses": 2}, "max_consecutive_losses"),
         ({}, {}, {"trades_today": 3}, "max_trades_per_day"),

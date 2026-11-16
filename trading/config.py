@@ -32,17 +32,15 @@ class ExecutionConfig:
     magic: int
     risk_fraction: float
     max_daily_loss: float
-    max_trades_per_day: int
     max_open_positions: int
     max_spread_points: float
     deviation_points: int
     filling_mode: str | None
     max_volume: float
     volume_mode: str = "fixed"
-    fixed_volume: float = 0.01
     max_risk_amount: float | None = None
     pending_state_path: str = "logs/pending_executions.sqlite3"
-    pending_timeout_seconds: int = 300
+    pending_timeout_seconds: int = 900
 
 
 @dataclass(frozen=True)
@@ -117,8 +115,8 @@ def _gate_config(config: dict[str, Any]) -> GateConfig:
         raise ConfigError("gate loss limits must be positive")
     if gate.max_consecutive_losses < 0 or gate.max_trades_per_day < 0:
         raise ConfigError("gate trade limits must be non-negative")
-    if gate.max_spread < 0:
-        raise ConfigError("gate.max_spread must be non-negative")
+    if gate.max_spread_points < 0:
+        raise ConfigError("gate.max_spread_points must be non-negative")
     return gate
 
 
@@ -161,13 +159,6 @@ def parse_config(config: dict[str, Any]) -> DemoConfig:
         )
     volume_mode = volume_mode.strip().lower()
 
-    fixed_volume = execution.get("fixed_volume", 0.02)
-    if isinstance(fixed_volume, bool) or not isinstance(fixed_volume, (int, float)):
-        raise ConfigError("execution.fixed_volume must be a number")
-    fixed_volume = float(fixed_volume)
-    if fixed_volume <= 0:
-        raise ConfigError("execution.fixed_volume must be positive")
-
     max_risk_amount = execution.get("max_risk_amount")
     if max_risk_amount is not None:
         if isinstance(max_risk_amount, bool) or not isinstance(
@@ -184,7 +175,7 @@ def parse_config(config: dict[str, Any]) -> DemoConfig:
     if not isinstance(pending_state_path, str) or not pending_state_path.strip():
         raise ConfigError("execution.pending_state_path must be a non-empty string")
 
-    pending_timeout_seconds = execution.get("pending_timeout_seconds", 300)
+    pending_timeout_seconds = execution.get("pending_timeout_seconds", 900)
     if isinstance(pending_timeout_seconds, bool) or not isinstance(
         pending_timeout_seconds, int
     ):
@@ -208,14 +199,12 @@ def parse_config(config: dict[str, Any]) -> DemoConfig:
             magic=magic,
             risk_fraction=_fraction(execution, "risk_per_trade", "execution", 0.05),
             max_daily_loss=_fraction(execution, "max_daily_loss", "execution", 1.0),
-            max_trades_per_day=_integer(execution, "max_trades_per_day", "execution"),
             max_open_positions=_integer(execution, "max_open_positions", "execution"),
             max_spread_points=_number(execution, "max_spread_points", "execution"),
             deviation_points=_integer(execution, "deviation_points", "execution"),
             filling_mode=filling_mode,
             max_volume=max_volume,
             volume_mode=volume_mode,
-            fixed_volume=fixed_volume,
             max_risk_amount=max_risk_amount,
             pending_state_path=pending_state_path.strip(),
             pending_timeout_seconds=pending_timeout_seconds,
