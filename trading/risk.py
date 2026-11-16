@@ -9,6 +9,17 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+# Floating-point subtraction of two nearby prices makes an exact-threshold
+# reward/risk ratio land a few ulps below the threshold (e.g. 1.99999999999995
+# for a target that was computed as exactly 2.0). Without a tolerance a quarter
+# of valid signals would be rejected with "2.00 is below the required 2.00".
+RR_TOLERANCE = 1e-9
+
+
+def _reward_risk_tolerance(min_reward_risk: float) -> float:
+    """Absolute slack allowed when comparing a reward/risk ratio."""
+    return max(RR_TOLERANCE, abs(min_reward_risk) * RR_TOLERANCE)
+
 
 class RiskError(ValueError):
     """Raised when a trade proposal cannot be sized or validated safely."""
@@ -171,7 +182,9 @@ def validate_proposal(
             raise RiskError(
                 f"SL/TP distance is below the broker minimum {minimum:.5f}"
             )
-    if min_reward_risk > 0 and reward / risk < min_reward_risk:
+    if min_reward_risk > 0 and reward / risk < min_reward_risk - _reward_risk_tolerance(
+        min_reward_risk
+    ):
         raise RiskError(
             f"reward:risk {reward / risk:.2f} is below the required {min_reward_risk:.2f}"
         )

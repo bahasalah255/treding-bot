@@ -29,7 +29,8 @@ class GateConfig:
     session_enabled: bool = False
     session_utc_start: str = "00:00"
     session_utc_end: str = "23:59"
-    max_spread: float = 0.50
+    # Spread limit in points, so it shares one unit with execution config.
+    max_spread_points: float = 60.0
 
     def session_bounds(self) -> tuple[time, time]:
         try:
@@ -43,7 +44,7 @@ class GateConfig:
 
 @dataclass(frozen=True)
 class GateMarketState:
-    spread: float
+    spread_points: float
     utc_now: datetime
     candle_id: str
     local_direction: str | None = None
@@ -108,12 +109,15 @@ def evaluate_entry_gate(
         )
 
     rr = getattr(signal, "risk_reward", None)
-    if rr is None or float(rr) < settings.min_rr:
+    if rr is None or float(rr) < settings.min_rr - max(1e-9, settings.min_rr * 1e-9):
         failed.append(f"risk_reward {rr!r} < {settings.min_rr:g}")
     if settings.session_enabled and not _in_session(settings, market_state.utc_now):
         failed.append("outside_enabled_session")
-    if market_state.spread > settings.max_spread:
-        failed.append(f"spread {market_state.spread:g} > {settings.max_spread:g}")
+    if market_state.spread_points > settings.max_spread_points:
+        failed.append(
+            f"spread {market_state.spread_points:g} pts > "
+            f"{settings.max_spread_points:g} pts"
+        )
     if account_state.daily_loss_usd >= settings.max_daily_loss_usd:
         failed.append("max_daily_loss_usd")
     if account_state.consecutive_losses >= settings.max_consecutive_losses:

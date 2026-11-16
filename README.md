@@ -187,11 +187,21 @@ Runtime settings live in `config/demo.yaml`. Safety properties:
 
 - Only fully closed candles are used; future, duplicate, out-of-order, and naive
   timestamps are rejected by `data/timestamp_validation.py`.
+- The latest candle must be fresh: data older than three timeframes is refused,
+  because MT5 can answer with a stale cache right after the terminal wakes up.
+- A local entry gate (`trading/gate_config.py`) is the last decision before
+  execution: local score and score gap, reward:risk, spread, session, daily and
+  total loss caps, consecutive losses, open positions, and one-entry-per-candle.
+- Stops and targets are ATR-based (`1.5 x ATR14`, `2R`) and rounded to the
+  symbol's price precision; the model's own levels are not sent to the broker.
 - Orders are sized from the terminal's own `order_calc_profit`, not from
-  `trade_tick_value` (some brokers report it 10x too small).
+  `trade_tick_value` (some brokers report it 10x too small). The demo default is
+  a fixed volume so the gate's dollar limits stay the single risk owner.
 - Entries are skipped when the spread is too wide, a position is already open,
-  the daily trade cap is reached, or the daily loss limit is hit.
-- Signals must pass direction, broker stop distance, and reward:risk checks.
+  the daily trade cap is reached, or a daily loss cap is hit.
+- The kill switch stops the daemon with exit code 2 once total losses reach
+  `gate.max_total_loss_usd`. It stays latched across restarts; after reviewing
+  the account, clear it with `python -m trading.daemon --reset-kill-switch`.
 - Every signal, block, error, and order is appended to `logs/journal-YYYY-MM-DD.jsonl`.
 - `logs/state.json` means a restart never re-trades the same candle, and a
   single-instance lock prevents two daemons on one account.
@@ -203,10 +213,14 @@ Runtime settings live in `config/demo.yaml`. Safety properties:
   reconciliation.
 - `logs/monitoring.csv` records closed-candle diagnostics separately from the
   JSONL decision journal.
+- `FORCE_TEST_TRADE=BUY` (or `SELL`) sends one deterministic demo order without
+  calling the model, so execution can be tested end to end. It is refused on a
+  non-demo account and used at most once per process.
 
 ## Safety boundary
 
 Keep execution on a demo account. Real-money trading is out of scope: the
-executor refuses any non-demo `trade_mode`, and execution is disabled unless
-`ENABLE_DEMO_TRADING=1` is set deliberately. Do not add credentials for a live
-account, and re-run the backtest and a dry-run pass after every strategy change.
+executor refuses any non-demo `trade_mode`, and there is no environment variable
+that unlocks a live account. Execution is disabled unless `ENABLE_DEMO_TRADING=1`
+is set deliberately. Do not add credentials for a live account, and re-run the
+backtest and a dry-run pass after every strategy change.

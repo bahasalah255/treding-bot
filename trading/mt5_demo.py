@@ -141,16 +141,12 @@ def require_demo_account(
     trade_mode = int(getattr(account, "trade_mode", -1))
     login = int(getattr(account, "login", 0))
     if trade_mode != int(demo_mode):
-        allowed = {
-            int(value.strip())
-            for value in os.environ.get("LIVE_ALLOWED_ACCOUNTS", "").split(",")
-            if value.strip().isdigit()
-        }
-        if os.environ.get("ENABLE_LIVE_TRADING") != "1" or login not in allowed:
-            raise ExecutionError(
-                f"refusing account {login}: not a demo account; live trading requires "
-                "ENABLE_LIVE_TRADING=1 and LIVE_ALLOWED_ACCOUNTS"
-            )
+        # Real-money trading is intentionally not implemented. This is the
+        # hard boundary of the project, not a configurable switch.
+        raise ExecutionError(
+            f"refusing account {login}: trade_mode {trade_mode} is not a demo "
+            "account; this bot only ever trades demo accounts"
+        )
     if require_expert and not bool(getattr(account, "trade_expert", True)):
         raise ExecutionError(
             "algo trading is disabled for this account; enable Algo Trading in the terminal"
@@ -1067,8 +1063,9 @@ def submit_signal(
 
 
 def is_live_trading_enabled() -> bool:
-    """Return whether an explicitly enabled demo or allow-listed live run may trade."""
-    return (
-        os.environ.get("ENABLE_DEMO_TRADING") == "1"
-        or os.environ.get("ENABLE_LIVE_TRADING") == "1"
-    )
+    """The second safety switch, on top of the demo-account check.
+
+    Only the demo switch exists: there is no environment variable that turns a
+    real account into a tradeable one.
+    """
+    return os.environ.get("ENABLE_DEMO_TRADING") == "1"

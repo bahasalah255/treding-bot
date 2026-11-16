@@ -138,16 +138,25 @@ class FakeTerminal:
 
 
 def _config(**execution_overrides):
+    gate_overrides = execution_overrides.pop("gate", None)
     base = {
         "account": {"symbol": SYMBOL, "timeframe": "M5"},
+        "gate": {
+            "min_score": 0.0,
+            "min_score_gap": 0.0,
+            "min_rr": 1.5,
+            "fixed_volume": 0.01,
+            "max_daily_loss_usd": 1_000.0,
+            "max_total_loss_usd": 10_000.0,
+            "max_trades_per_day": 3,
+            "max_spread_points": 60,
+        },
         "execution": {
             "magic": MAGIC,
             "risk_per_trade": 0.005,
             "max_daily_loss": 0.02,
-            "max_trades_per_day": 3,
             "max_open_positions": 1,
             "max_spread_points": 60,
-            "min_reward_risk": 1.5,
             "deviation_points": 20,
             "max_volume": 1.0,
             "filling_mode": None,
@@ -161,6 +170,8 @@ def _config(**execution_overrides):
         "model": {"name": "openai/gpt-oss-20b", "context_bars": 100},
     }
     base["execution"].update(execution_overrides)
+    if gate_overrides:
+        base["gate"].update(gate_overrides)
     return parse_config(base)
 
 
@@ -246,7 +257,7 @@ def test_expired_pending_blocks_new_entries(tmp_path):
 def test_fixed_volume_mode_sends_the_exact_configured_volume(tmp_path):
     terminal = FakeTerminal()
     journal = Journal(tmp_path, echo=False)
-    config = _config(volume_mode="fixed", fixed_volume=0.02, max_risk_amount=100.0)
+    config = _config(volume_mode="fixed", max_risk_amount=100.0, gate={"fixed_volume": 0.02})
 
     result = submit_signal(
         _signal(), config, journal, RuntimeState(), terminal,
@@ -254,13 +265,13 @@ def test_fixed_volume_mode_sends_the_exact_configured_volume(tmp_path):
     )
 
     assert result.status == "filled"
-    assert terminal.sent[0]["volume"] == pytest.approx(0.01)
+    assert terminal.sent[0]["volume"] == pytest.approx(0.02)
 
 
 def test_fixed_volume_risk_limit_blocks_the_order(tmp_path):
     terminal = FakeTerminal()
     journal = Journal(tmp_path, echo=False)
-    config = _config(volume_mode="fixed", fixed_volume=0.02, max_risk_amount=1.0)
+    config = _config(volume_mode="fixed", max_risk_amount=1.0, gate={"fixed_volume": 0.02})
 
     result = submit_signal(
         _signal(), config, journal, RuntimeState(), terminal,
