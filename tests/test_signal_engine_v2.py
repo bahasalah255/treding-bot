@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from trading.groq_signal import (
+    GROQ_SIGNAL_SCHEMA,
     MIN_ANALYSIS_CANDLES,
     _detect_breakout_retest,
     _confirmed_pivots,
@@ -14,6 +15,7 @@ from trading.groq_signal import (
     _rr_mismatch_diagnostic,
     _validate_frame,
     _validate_setup,
+    calculate_risk_reward,
     request_signal,
 )
 
@@ -260,6 +262,67 @@ def test_request_signal_handles_invalid_json_and_api_failure(monkeypatch):
     assert "Groq analysis failed" in signal.rationale
 
 
+def test_request_options_uses_strict_schema_without_secrets():
+    from trading.groq_signal import _request_options
+
+    options = _request_options("openai/gpt-oss-20b")
+
+    assert options["response_format"]["type"] == "json_schema"
+    schema = options["response_format"]["json_schema"]
+    assert schema["strict"] is True
+    assert options["max_completion_tokens"] == 4096
+    assert "max_tokens" not in options
+    assert options["reasoning_effort"] == "low"
+    assert schema["schema"] is GROQ_SIGNAL_SCHEMA
+    assert set(schema["schema"]["required"]) == set(schema["schema"]["properties"])
+    assert schema["schema"]["additionalProperties"] is False
+    assert "risk_reward" not in schema["schema"]["properties"]
+    assert "api_key" not in repr(options).lower()
+
+
+def test_http_400_remains_fail_closed(monkeypatch):
+    class BadRequestError(RuntimeError):
+        status_code = 400
+
+    def fail(**options):
+        raise BadRequestError("json_validate_failed")
+
+    monkeypatch.setattr(
+        "trading.groq_signal.Groq",
+        lambda **kwargs: SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=fail))
+        ),
+    )
+
+    signal = request_signal(_frame())
+
+    assert signal.action == "DATA_ERROR"
+    assert "Groq analysis failed" in signal.rationale
+
+
+def test_token_exhaustion_remains_fail_closed(monkeypatch):
+    class TokenExhaustion(RuntimeError):
+        status_code = 400
+
+    def fail(**options):
+        raise TokenExhaustion(
+            "json_validate_failed: max completion tokens reached before "
+            "generating a valid document"
+        )
+
+    monkeypatch.setattr(
+        "trading.groq_signal.Groq",
+        lambda **kwargs: SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=fail))
+        ),
+    )
+
+    signal = request_signal(_frame())
+
+    assert signal.action == "DATA_ERROR"
+    assert "Groq analysis failed" in signal.rationale
+
+
 def test_local_rejection_preserves_groq_rejection_reasons(monkeypatch):
     payload = _valid_payload("SELL")
     payload.update({
@@ -290,7 +353,7 @@ def test_local_rejection_preserves_groq_rejection_reasons(monkeypatch):
         ("SELL", 100.0, 110.0, 80.0),
     ],
 )
-def test_rr_mismatch_returns_data_error_with_diagnostics(
+def test_incorrect_groq_rr_is_ignored_for_validation(
     monkeypatch, action, entry, stop_loss, take_profit
 ):
     payload = _valid_payload(action)
@@ -311,19 +374,9 @@ def test_rr_mismatch_returns_data_error_with_diagnostics(
 
     signal = request_signal(_frame())
 
-    assert signal.action == "DATA_ERROR"
-    assert signal.rationale == "Groq risk_reward does not match calculated prices"
-    assert "symbol=XAUUSD" in signal.diagnostic
-    assert f"action={action}" in signal.diagnostic
-    assert "groq_entry=100.0" in signal.diagnostic
-    assert "groq_stop_loss=" in signal.diagnostic
-    assert "groq_take_profit=" in signal.diagnostic
-    assert "groq_risk_reward=1.0" in signal.diagnostic
-    assert "calculated_risk_reward=2.0" in signal.diagnostic
-    assert "absolute_difference=1.0" in signal.diagnostic
-    assert "relative_difference=0.5" in signal.diagnostic
-    assert "rel_tol=0.01" in signal.diagnostic
-    assert "abs_tol=0.01" in signal.diagnostic
+    assert signal.action != "DATA_ERROR"
+    assert signal.diagnostic is not None
+    assert "Groq risk_reward ignored" in signal.diagnostic
 
 
 def test_rr_within_tolerance_is_accepted(monkeypatch):
@@ -348,7 +401,7 @@ def test_rr_within_tolerance_is_accepted(monkeypatch):
     assert signal.action != "DATA_ERROR"
 
 
-def test_rr_outside_tolerance_remains_data_error(monkeypatch):
+def test_rr_outside_tolerance_does_not_change_python_validation(monkeypatch):
     payload = _valid_payload("SELL")
     payload.update({
         "entry_price": 100.0,
@@ -367,8 +420,76 @@ def test_rr_outside_tolerance_remains_data_error(monkeypatch):
 
     signal = request_signal(_frame())
 
-    assert signal.action == "DATA_ERROR"
-    assert "absolute_difference=0.0299999999999998" in signal.diagnostic
+    assert signal.action != "DATA_ERROR"
+    assert "Groq risk_reward ignored" in signal.diagnostic
+
+
+@pytest.mark.parametrize(
+    ("action", "entry", "stop_loss", "take_profit", "expected"),
+    [
+        ("BUY", 100.0, 90.0, 120.0, 2.0),
+        ("SELL", 100.0, 110.0, 80.0, 2.0),
+        ("BUY", 100.0, 90.0, 130.0, 3.0),
+        ("SELL", 100.0, 110.0, 70.0, 3.0),
+    ],
+)
+def test_python_calculates_authoritative_buy_and_sell_rr(
+    action, entry, stop_loss, take_profit, expected
+):
+    assert calculate_risk_reward(action, entry, stop_loss, take_profit) == expected
+
+
+@pytest.mark.parametrize(
+    ("action", "entry", "stop_loss", "take_profit"),
+    [
+        ("BUY", 100.0, 95.0, 105.0),
+        ("SELL", 100.0, 105.0, 95.0),
+    ],
+)
+def test_python_rr_below_minimum_is_calculated_without_lowering_the_gate(
+    action, entry, stop_loss, take_profit
+):
+    assert calculate_risk_reward(action, entry, stop_loss, take_profit) == 1.0
+
+
+@pytest.mark.parametrize(
+    ("action", "entry", "stop_loss", "take_profit"),
+    [
+        ("BUY", 100.0, 100.0, 120.0),
+        ("BUY", 100.0, 90.0, 100.0),
+        ("BUY", 100.0, 110.0, 120.0),
+        ("SELL", 100.0, 100.0, 80.0),
+        ("SELL", 100.0, 110.0, 100.0),
+        ("SELL", 100.0, 90.0, 80.0),
+        ("BUY", float("nan"), 90.0, 120.0),
+        ("SELL", 100.0, float("inf"), 80.0),
+    ],
+)
+def test_python_rr_rejects_invalid_geometry_and_non_finite_prices(
+    action, entry, stop_loss, take_profit
+):
+    with pytest.raises(ValueError):
+        calculate_risk_reward(action, entry, stop_loss, take_profit)
+
+
+def test_missing_groq_rr_is_accepted_as_non_authoritative(monkeypatch):
+    payload = _valid_payload("BUY")
+    payload.pop("risk_reward")
+    payload.update({
+        "entry_price": 100.0,
+        "stop_loss": 90.0,
+        "take_profit": 120.0,
+    })
+    text = json.dumps(payload)
+    monkeypatch.setattr(
+        "trading.groq_signal.Groq",
+        lambda **kwargs: SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=lambda **options: _groq_response(text)))
+        ),
+    )
+    signal = request_signal(_frame())
+    assert signal.action == "NO_TRADE"
 
 
 def test_rr_mismatch_diagnostic_marks_missing_values():

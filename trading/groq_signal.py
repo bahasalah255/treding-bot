@@ -13,6 +13,7 @@ import math
 import os
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import pandas as pd
@@ -29,6 +30,38 @@ SWING_LEFT = 2
 SWING_RIGHT = 2
 RR_REL_TOLERANCE = 0.01
 RR_ABS_TOLERANCE = 0.01
+
+GROQ_SIGNAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["BUY", "SELL", "NO_TRADE"]},
+        "entry_price": {"type": ["number", "null"]},
+        "stop_loss": {"type": ["number", "null"]},
+        "take_profit": {"type": ["number", "null"]},
+        "market_trend": {"type": "string"},
+        "market_condition": {"type": "string"},
+        "buy_setup_score": {"type": "number"},
+        "sell_setup_score": {"type": "number"},
+        "rationale": {"type": "string"},
+        "rejection_reasons": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": [
+        "action",
+        "entry_price",
+        "stop_loss",
+        "take_profit",
+        "market_trend",
+        "market_condition",
+        "buy_setup_score",
+        "sell_setup_score",
+        "rationale",
+        "rejection_reasons",
+    ],
+    "additionalProperties": False,
+}
 
 
 @dataclass(frozen=True)
@@ -72,6 +105,7 @@ def _no_trade(
     reason: str,
     payload: dict[str, Any],
     evidence: dict[str, Any] | None = None,
+    diagnostic: str | None = None,
 ) -> Signal:
     local = evidence or {}
     return Signal(
@@ -85,6 +119,7 @@ def _no_trade(
         float(local.get("local_buy_score", 0.0)),
         float(local.get("local_sell_score", 0.0)),
         dict(local.get("local_score_breakdown", {})),
+        diagnostic,
     )
 
 
@@ -469,6 +504,56 @@ def _finite_number(value: Any, name: str) -> float:
     return number
 
 
+def calculate_risk_reward(
+    action: str,
+    entry: float,
+    stop_loss: float,
+    take_profit: float,
+) -> float:
+    """Calculate authoritative reward:risk from final validated prices."""
+    try:
+        entry_decimal = Decimal(str(entry))
+        stop_decimal = Decimal(str(stop_loss))
+        take_decimal = Decimal(str(take_profit))
+    except (InvalidOperation, ValueError):
+        raise ValueError("prices must be valid decimals") from None
+    if not all(value.is_finite() and value > 0 for value in (
+        entry_decimal, stop_decimal, take_decimal
+    )):
+        raise ValueError("prices must be finite and positive")
+    if action == "BUY":
+        risk = entry_decimal - stop_decimal
+        reward = take_decimal - entry_decimal
+    elif action == "SELL":
+        risk = stop_decimal - entry_decimal
+        reward = entry_decimal - take_decimal
+    else:
+        raise ValueError(f"unsupported action: {action!r}")
+    if risk <= 0 or reward <= 0:
+        raise ValueError("risk and reward must be positive")
+    return float(reward / risk)
+
+
+def _groq_rr_diagnostic(
+    supplied_rr: float | None,
+    calculated_rr: float,
+) -> str | None:
+    """Describe a non-authoritative Groq RR without rejecting the signal."""
+    if supplied_rr is None:
+        return "Groq risk_reward unavailable; Python calculation is authoritative"
+    if math.isclose(
+        supplied_rr,
+        calculated_rr,
+        rel_tol=RR_REL_TOLERANCE,
+        abs_tol=RR_ABS_TOLERANCE,
+    ):
+        return None
+    return (
+        f"Groq risk_reward ignored: supplied={supplied_rr} "
+        f"calculated={calculated_rr}"
+    )
+
+
 def _validate_setup(
     action: str,
     entry: float,
@@ -525,16 +610,15 @@ def _validate_setup(
 def build_prompt(evidence: dict[str, Any]) -> str:
     """Return the model prompt for one piece of causal market evidence."""
     return (
-        "Analyze XAUUSD using ONLY this causal evidence from closed candles. "
-        "Evaluate BUY and SELL independently. Groq is supplementary and cannot "
-        "override local validation. Return JSON only with exactly this schema: "
-        "action, entry_price, stop_loss, take_profit, risk_reward, market_trend, "
-        "market_condition, buy_setup_score, sell_setup_score, rationale, "
-        "rejection_reasons. Scores must be numbers from 0 to 100. "
-        "rejection_reasons MUST ALWAYS be a JSON array of strings. Use [] when "
-        "there are no rejection reasons. It must never be a string, null, object, "
-        "number array, or omitted. Use NO_TRADE with null prices if neither side "
-        "is valid. Never invent missing data.\n\n"
+        "Analyze XAUUSD using ONLY causal evidence from closed candles. "
+        "Evaluate BUY and SELL independently; local validation is authoritative. "
+        "Return only the required JSON fields: action, entry_price, stop_loss, "
+        "take_profit, market_trend, market_condition, "
+        "buy_setup_score, sell_setup_score, rationale, rejection_reasons. "
+        "Scores are numbers 0-100. rejection_reasons is an array of at most 3 "
+        "short strings, or []. Keep rationale under 160 characters. "
+        "Use NO_TRADE with null prices when neither side is valid. "
+        "Never invent missing data.\n\n"
         "EVIDENCE:\n" + json.dumps(evidence, separators=(",", ":"))
     )
 
@@ -555,12 +639,28 @@ def _request_options(model: str) -> dict[str, Any]:
     options: dict[str, Any] = {
         "model": model,
         "temperature": 0,
-        "max_tokens": 1200,
-        "response_format": {"type": "json_object"},
+        "max_completion_tokens": 4096,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "trading_signal",
+                "strict": True,
+                "schema": GROQ_SIGNAL_SCHEMA,
+            },
+        },
     }
-    reasoning_effort = os.environ.get("GROQ_REASONING_EFFORT", "").strip()
+    reasoning_effort = os.environ.get("GROQ_REASONING_EFFORT", "low").strip()
     if reasoning_effort:
         options["reasoning_effort"] = reasoning_effort
+    LOGGER.info(
+        "Groq request model=%s temperature=%s max_completion_tokens=%s "
+        "response_format=%s reasoning_effort=%s",
+        options["model"],
+        options["temperature"],
+        options["max_completion_tokens"],
+        options["response_format"],
+        options.get("reasoning_effort", "unset"),
+    )
     return options
 
 
@@ -586,8 +686,10 @@ def request_signal(
         return _data_error("indicator warm-up is incomplete")
     try:
         groq_client = _client(client)
+        prompt = build_prompt(evidence)
+        LOGGER.info("Groq request prompt_chars=%s", len(prompt))
         response = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": build_prompt(evidence)}],
+            messages=[{"role": "user", "content": prompt}],
             **_request_options(model or os.environ.get("GROQ_MODEL", DEFAULT_MODEL)),
         )
         content = _content(response)
@@ -601,7 +703,7 @@ def request_signal(
     try:
         payload = json.loads(content[start:end + 1])
         required = {
-            "action", "entry_price", "stop_loss", "take_profit", "risk_reward",
+            "action", "entry_price", "stop_loss", "take_profit",
             "market_trend", "market_condition", "buy_setup_score",
             "sell_setup_score", "rationale", "rejection_reasons",
         }
@@ -642,34 +744,35 @@ def request_signal(
         entry = _finite_number(payload["entry_price"], "entry_price")
         stop_loss = _finite_number(payload["stop_loss"], "stop_loss")
         take_profit = _finite_number(payload["take_profit"], "take_profit")
-        supplied_rr = _finite_number(payload["risk_reward"], "risk_reward")
     except ValueError as exc:
         return _data_error(str(exc))
-    calculated_rr = (
-        abs(take_profit - entry) / abs(entry - stop_loss)
-        if entry != stop_loss else 0.0
-    )
-    if not math.isclose(
-        supplied_rr,
-        calculated_rr,
-        rel_tol=RR_REL_TOLERANCE,
-        abs_tol=RR_ABS_TOLERANCE,
-    ):
-        diagnostic = _rr_mismatch_diagnostic(
-            action, entry, stop_loss, take_profit,
-            supplied_rr, calculated_rr, evidence.get("as_of"),
+    try:
+        calculated_rr = calculate_risk_reward(
+            action, entry, stop_loss, take_profit
         )
-        LOGGER.warning("%s", diagnostic)
-        return _data_error(
-            "Groq risk_reward does not match calculated prices", diagnostic
+    except ValueError as exc:
+        return _data_error(str(exc))
+    supplied_rr = None
+    if payload.get("risk_reward") is not None:
+        try:
+            supplied_rr = _finite_number(payload["risk_reward"], "risk_reward")
+        except ValueError as exc:
+            return _data_error(str(exc))
+    rr_diagnostic = _groq_rr_diagnostic(supplied_rr, calculated_rr)
+    if rr_diagnostic:
+        LOGGER.warning(
+            "%s symbol=XAUUSD timestamp=%s",
+            rr_diagnostic,
+            evidence.get("as_of", "unavailable"),
         )
     setup_error = _validate_setup(action, entry, stop_loss, take_profit, evidence)
     if setup_error:
-        return _no_trade(setup_error, payload, evidence)
+        return _no_trade(setup_error, payload, evidence, rr_diagnostic)
     return Signal(
         action, entry, stop_loss, take_profit, calculated_rr,
         str(payload["market_trend"]), str(payload["market_condition"]),
         *scores, payload["rationale"], tuple(rejection),
         evidence["local_buy_score"], evidence["local_sell_score"],
         evidence["local_score_breakdown"],
+        rr_diagnostic,
     )
