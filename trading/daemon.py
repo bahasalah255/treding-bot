@@ -1,116 +1,97 @@
-"""Continuous, guarded Demo monitor for XAUUSD M5."""
+"""Continuous, guarded demo monitor.
+
+Runs one MetaTrader 5 session for its whole lifetime, trades only closed
+candles, journals every decision, reconciles ambiguous submissions, and never
+re-trades a candle after a restart.
+"""
 
 from __future__ import annotations
 
 import argparse
 import logging
 import os
+import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
 
-import MetaTrader5 as mt5
 import pandas as pd
 
-from data.timestamp_validation import (
-    TimestampValidationError,
-    select_closed_m5_candles,
-)
-from trading.groq_signal import Signal, request_signal
+from data.timestamp_validation import TimestampValidationError, select_closed_m5_candles
+from trading.config import DEFAULT_PATH, DemoConfig, TIMEFRAMES, load_config
+from trading.groq_signal import Signal
+from trading.journal import Journal
 from trading.monitor_log import append_monitor_log
-from trading.mt5_demo import execute_demo_signal, reconcile_pending_executions
+from trading.state import StateStore, RuntimeState, single_instance
 
 LOGGER = logging.getLogger(__name__)
+ROOT = Path(__file__).resolve().parents[1]
+LOG_DIR = ROOT / "logs"
+STATE_PATH = LOG_DIR / "state.json"
+LOCK_PATH = LOG_DIR / "bot.lock"
+MIN_BARS = 20
 FORCED_TEST_DISTANCE = 3.0
 FORCED_TEST_REWARD = 6.6
 
 
-def _forced_test_signal(symbol: str, action: str) -> Signal:
-    """Build one deterministic test signal from the current Demo tick."""
-    if not mt5.initialize():
-        raise RuntimeError(f"MT5 initialization failed: {mt5.last_error()}")
-    try:
-        info = mt5.symbol_info(symbol)
-        tick = mt5.symbol_info_tick(symbol)
-        if info is None or tick is None:
-            raise RuntimeError(f"unable to read {symbol}: {mt5.last_error()}")
-        if not mt5.symbol_select(symbol, True):
-            raise RuntimeError(f"unable to select {symbol}: {mt5.last_error()}")
-        digits = int(getattr(info, "digits", 0))
-        entry = float(tick.ask if action == "BUY" else tick.bid)
-        if action == "BUY":
-            stop_loss = entry - FORCED_TEST_DISTANCE
-            take_profit = entry + FORCED_TEST_REWARD
-        else:
-            stop_loss = entry + FORCED_TEST_DISTANCE
-            take_profit = entry - FORCED_TEST_REWARD
-        entry = round(entry, digits)
-        stop_loss = round(stop_loss, digits)
-        take_profit = round(take_profit, digits)
-        return Signal(
-            action,
-            entry,
-            stop_loss,
-            take_profit,
-            2.2,
-            "FORCED_TEST",
-            "FORCED_TEST",
-            0.0,
-            0.0,
-            "FORCED TEST TRADE",
-            (),
-        )
-    finally:
-        mt5.shutdown()
-
-
-def _forced_test_error(action: str, error: Exception) -> Signal:
+def forced_test_signal(terminal: Any, symbol: str, action: str) -> Signal:
+    """Build one deterministic test signal from the current terminal tick."""
+    info = terminal.symbol_info(symbol)
+    tick = terminal.symbol_info_tick(symbol)
+    if info is None or tick is None:
+        raise RuntimeError(f"unable to read {symbol}: {terminal.last_error()}")
+    if not terminal.symbol_select(symbol, True):
+        raise RuntimeError(f"unable to select {symbol}: {terminal.last_error()}")
+    digits = int(getattr(info, "digits", 0))
+    entry = float(tick.ask if action == "BUY" else tick.bid)
+    if action == "BUY":
+        stop_loss = entry - FORCED_TEST_DISTANCE
+        take_profit = entry + FORCED_TEST_REWARD
+    else:
+        stop_loss = entry + FORCED_TEST_DISTANCE
+        take_profit = entry - FORCED_TEST_REWARD
     return Signal(
-        "DATA_ERROR",
-        None,
-        None,
-        None,
-        None,
-        "UNKNOWN",
-        "INVALID_DATA",
+        action,
+        round(entry, digits),
+        round(stop_loss, digits),
+        round(take_profit, digits),
+        2.2,
+        "FORCED_TEST",
+        "FORCED_TEST",
         0.0,
         0.0,
-        f"FORCED TEST TRADE failed: {type(error).__name__}: {error}",
-        (f"FORCED TEST TRADE failed: {type(error).__name__}: {error}",),
+        "FORCED TEST TRADE",
+        (),
     )
 
 
-def fetch_closed_m5(symbol: str, count: int = 500) -> pd.DataFrame:
-    """Fetch only closed M5 candles from the connected MT5 terminal."""
-    current_utc = datetime.now(timezone.utc)
-    if not mt5.initialize():
-        raise RuntimeError(f"MT5 initialization failed: {mt5.last_error()}")
+def timeframe_minutes(timeframe: str) -> int:
+    """Return the candle size in minutes for a configured timeframe."""
     try:
-        # Position 1 starts at the last completed candle; position 0 is forming.
-        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 1, count)
-        if rates is None or len(rates) < 20:
-            raise RuntimeError(f"MT5 returned insufficient rates: {mt5.last_error()}")
-        selected = select_closed_m5_candles(rates, current_utc)
-        selected.attrs["mt5_start_pos"] = 1
-        return selected
-    finally:
-        mt5.shutdown()
+        return TIMEFRAMES[timeframe.upper()]
+    except KeyError as exc:
+        raise ValueError(f"unsupported timeframe {timeframe!r}") from exc
 
 
-def _safe_log(value: object) -> str:
-    return str(value).encode("ascii", "backslashreplace").decode("ascii")
+def monitor_path(config: DemoConfig) -> Path:
+    """Resolve the CSV diagnostics log path against the repository root."""
+    path = Path(config.monitor.csv_log)
+    return path if path.is_absolute() else ROOT / path
 
 
-def _write_monitor_log(
-    log_path: str,
-    symbol: str,
+def log_monitor(
+    config: DemoConfig,
     event: str,
     status: str,
-    values: dict[str, object] | None = None,
+    values: dict[str, Any] | None = None,
 ) -> None:
+    """Write a CSV diagnostics row; a logging failure must not stop trading."""
     try:
         append_monitor_log(
-            log_path,
-            symbol=symbol,
+            monitor_path(config),
+            symbol=config.account.symbol,
+            timeframe=config.account.timeframe,
             event=event,
             status=status,
             values=values,
@@ -119,164 +100,344 @@ def _write_monitor_log(
         print(f"CSV_LOG_ERROR: {type(exc).__name__}: {exc}")
 
 
-def run_monitor(
-    symbol: str,
-    interval_seconds: int,
-    once: bool = False,
-    log_path: str = r"logs\monitoring.csv",
+def read_closed_bars(terminal: Any, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
+    """Return only fully closed candles, newest last, validated for UTC order."""
+    attribute = f"TIMEFRAME_{timeframe.upper()}"
+    timeframe_value = getattr(terminal, attribute, None)
+    if timeframe_value is None:
+        raise ValueError(f"unsupported timeframe {timeframe!r}")
+    rates = terminal.copy_rates_from_pos(symbol, timeframe_value, 0, count)
+    if rates is None or len(rates) < MIN_BARS:
+        raise RuntimeError(f"MT5 returned too few rates: {terminal.last_error()}")
+    # The selector drops the forming candle and rejects future/duplicate/
+    # out-of-order timestamps, so nothing unclosed can reach the model.
+    return select_closed_m5_candles(
+        rates,
+        datetime.now(timezone.utc),
+        minimum_count=MIN_BARS,
+        timeframe_minutes=timeframe_minutes(timeframe),
+    )
+
+
+def journal_new_deals(
+    terminal: Any, config: DemoConfig, journal: Journal, state: RuntimeState
 ) -> None:
-    """Monitor new closed candles until interrupted."""
-    last_processed: pd.Timestamp | None = None
+    """Record deals this bot closed since the last poll."""
+    from trading.mt5_demo import new_deals
+
+    for deal in new_deals(terminal, config.execution.magic, state.last_deal_ticket):
+        journal.write(
+            "deal",
+            ticket=int(deal.ticket),
+            position=int(getattr(deal, "position_id", 0)),
+            symbol=str(getattr(deal, "symbol", config.account.symbol)),
+            entry=int(getattr(deal, "entry", 0)),
+            volume=float(getattr(deal, "volume", 0.0)),
+            price=float(getattr(deal, "price", 0.0)),
+            profit=float(getattr(deal, "profit", 0.0)),
+            commission=float(getattr(deal, "commission", 0.0)),
+            swap=float(getattr(deal, "swap", 0.0)),
+            deal_time=datetime.fromtimestamp(
+                int(deal.time), tz=timezone.utc
+            ).isoformat(),
+        )
+        state.last_deal_ticket = int(deal.ticket)
+
+
+def process_candle(
+    terminal: Any,
+    config: DemoConfig,
+    journal: Journal,
+    state: RuntimeState,
+    frame: pd.DataFrame,
+    execute: bool,
+    force_action: str | None = None,
+) -> None:
+    """Turn the newest closed candle into at most one demo order."""
+    from trading.mt5_demo import ExecutionError, submit_signal
+
+    candle = frame.index[-1].isoformat()
+    close_time = (
+        frame.index[-1] + timedelta(minutes=timeframe_minutes(config.account.timeframe))
+    ).isoformat()
+    try:
+        if force_action is not None:
+            signal = forced_test_signal(terminal, config.account.symbol, force_action)
+        else:
+            from trading.groq_signal import request_signal
+
+            signal = request_signal(
+                frame,
+                model=config.model.name,
+                context_bars=config.model.context_bars,
+            )
+    except Exception as exc:  # noqa: BLE001 - the loop must survive
+        journal.write(
+            "error",
+            stage="signal",
+            candle=candle,
+            error=type(exc).__name__,
+            detail=str(exc),
+            attempt=state.signal_attempts,
+        )
+        log_monitor(
+            config,
+            "signal",
+            "ERROR",
+            {"candle_open": candle, "candle_close": close_time,
+             "error": f"{type(exc).__name__}: {exc}"},
+        )
+        return
+
+    journal.write(
+        "signal",
+        candle=candle,
+        action=signal.action,
+        entry_price=signal.entry_price,
+        stop_loss=signal.stop_loss,
+        take_profit=signal.take_profit,
+        risk_reward=signal.risk_reward,
+        market_trend=signal.market_trend,
+        market_condition=signal.market_condition,
+        buy_setup_score=signal.buy_setup_score,
+        sell_setup_score=signal.sell_setup_score,
+        local_buy_score=signal.local_buy_score,
+        local_sell_score=signal.local_sell_score,
+        local_score_breakdown=signal.local_score_breakdown,
+        rejection_reasons=list(signal.rejection_reasons),
+        rationale=signal.rationale,
+        diagnostic=signal.diagnostic,
+        timeframe=config.account.timeframe,
+    )
+    if signal.action in {"NO_TRADE", "DATA_ERROR"}:
+        log_monitor(
+            config,
+            "signal",
+            "COMPLETE",
+            {
+                "current_utc": datetime.now(timezone.utc).isoformat(),
+                "candle_open": candle,
+                "candle_close": close_time,
+                "latest_closed_candle": candle,
+                "action": signal.action,
+                "entry_price": signal.entry_price,
+                "stop_loss": signal.stop_loss,
+                "take_profit": signal.take_profit,
+                "risk_reward": signal.risk_reward,
+                "market_trend": signal.market_trend,
+                "market_condition": signal.market_condition,
+                "buy_setup_score": signal.buy_setup_score,
+                "sell_setup_score": signal.sell_setup_score,
+                "local_buy_score": signal.local_buy_score,
+                "local_sell_score": signal.local_sell_score,
+                "local_score_breakdown": signal.local_score_breakdown,
+                "rationale": signal.rationale,
+                "rejection_reasons": signal.rejection_reasons,
+                "error": signal.diagnostic or "",
+            },
+        )
+        state.finish_candle(candle)
+        return
+
+    try:
+        result = submit_signal(signal, config, journal, state, terminal, execute=execute)
+    except ExecutionError as exc:
+        journal.write("error", stage="execution", candle=candle, detail=str(exc))
+        log_monitor(
+            config, "execution", "ERROR", {"candle_open": candle, "error": str(exc)}
+        )
+        state.finish_candle(candle)
+        return
+    journal.write("result", candle=candle, status=result.status, detail=result.detail)
+    log_monitor(
+        config,
+        "execution",
+        result.status.upper(),
+        {
+            "candle_open": candle,
+            "action": signal.action,
+            "entry_price": signal.entry_price,
+            "stop_loss": signal.stop_loss,
+            "take_profit": signal.take_profit,
+            "risk_reward": signal.risk_reward,
+            "execution_status": result.status,
+            "error": result.detail if result.status == "blocked" else "",
+        },
+    )
+    state.finish_candle(candle)
+
+
+def run(
+    config: DemoConfig,
+    *,
+    once: bool = False,
+    dry_run: bool = False,
+    journal_directory: Path = LOG_DIR,
+) -> None:
+    """Poll the terminal until interrupted."""
+    from trading.mt5_demo import (
+        ExecutionError,
+        is_live_trading_enabled,
+        reconcile_pending,
+        require_demo_account,
+        session,
+    )
+
+    journal = Journal(journal_directory)
+    store = StateStore(journal_directory / "state.json")
+    state = store.load()
+    execute = is_live_trading_enabled() and not dry_run
     forced_action = os.environ.get("FORCE_TEST_TRADE", "").strip().upper()
+    if forced_action not in {"BUY", "SELL"}:
+        forced_action = None
     forced_test_used = False
-    if forced_action in {"BUY", "SELL"}:
-        message = f"FORCE_TEST_TRADE actif : {forced_action}"
-        LOGGER.warning(message)
-        print(message)
-    print(f"Monitoring {symbol} M5 every {interval_seconds} seconds (Demo only).")
-    while True:
-        try:
-            frame = fetch_closed_m5(symbol)
-            candle_time = frame.index[-1]
-            reconciliation_status = reconcile_pending_executions(symbol)
-            if reconciliation_status:
-                print(reconciliation_status)
-            if candle_time != last_processed:
-                candle_close = candle_time + pd.Timedelta(5, unit="min")
-                print(f"MT5 start_pos: {frame.attrs['mt5_start_pos']}")
-                print(f"Raw rates count: {frame.attrs['raw_rates_count']}")
-                print(f"Raw latest candle: {frame.attrs['raw_latest_candle']}")
-                print(f"Filtered rates count: {frame.attrs['filtered_rates_count']}")
-                print(f"Latest closed candle: {frame.attrs['latest_closed_candle']}")
-                print(
-                    "Latest closed candle close time: "
-                    f"{frame.attrs['latest_closed_close_time']}"
+
+    with single_instance(journal_directory / "bot.lock"):
+        with session() as terminal:
+            # Refuse a live account before doing anything else, even in dry run.
+            account = require_demo_account(terminal, require_expert=execute)
+            journal.write(
+                "startup",
+                symbol=config.account.symbol,
+                timeframe=config.account.timeframe,
+                magic=config.execution.magic,
+                execute=execute,
+                volume_mode=config.execution.volume_mode,
+                login=account.login,
+                server=account.server,
+                balance=account.balance,
+                equity=account.equity,
+                leverage=account.leverage,
+                restarted_at=datetime.now(timezone.utc).isoformat(),
+            )
+            if not execute:
+                journal.write(
+                    "notice",
+                    detail="dry run: set ENABLE_DEMO_TRADING=1 to send demo orders",
                 )
-                print(f"Current UTC: {frame.attrs['current_utc']}")
-                print(f"Candle open time: {candle_time.isoformat()}")
-                print(f"Candle close time: {candle_close.isoformat()}")
-                print(f"Last closed candle: {candle_time.isoformat()}")
-                print(f"Selected candle: {candle_time.isoformat()}")
-                print("Timestamp validation: PASSED")
-                print("Future candle detected: False")
-                if forced_action in {"BUY", "SELL"} and not forced_test_used:
-                    forced_test_used = True
-                    try:
-                        signal = _forced_test_signal(symbol, forced_action)
-                    except Exception as exc:
-                        signal = _forced_test_error(forced_action, exc)
-                    print("Signal generation status: FORCED_TEST")
-                else:
-                    signal = request_signal(frame)
-                    print("Signal generation status: COMPLETE")
-                execution_status = reconciliation_status or ""
-                print(
-                    f"{datetime.now(timezone.utc).isoformat()} "
-                    f"candle={candle_time.isoformat()} signal={_safe_log(signal)}"
-                )
-                if (
-                    signal.action != "NO_TRADE"
-                    and not (
-                        reconciliation_status
-                        and reconciliation_status.startswith("EXECUTION_UNCONFIRMED")
+            if forced_action is not None:
+                message = f"FORCE_TEST_TRADE actif : {forced_action}"
+                LOGGER.warning(message)
+                journal.write("notice", detail=message)
+                print(message)
+
+            failures = 0
+            while True:
+                try:
+                    today = datetime.now(timezone.utc).date().isoformat()
+                    if state.roll_day(today):
+                        store.save(state)
+                    journal_new_deals(terminal, config, journal, state)
+
+                    reconciliation = reconcile_pending(terminal, config, journal)
+                    if reconciliation:
+                        journal.write("result", stage="reconciliation", detail=reconciliation)
+
+                    frame = read_closed_bars(
+                        terminal,
+                        config.account.symbol,
+                        config.account.timeframe,
+                        config.monitor.bars,
                     )
-                ):
-                    execution_status = execute_demo_signal(symbol, signal)
-                    print(execution_status)
-                _write_monitor_log(
-                    log_path,
-                    symbol,
-                    "signal",
-                    "COMPLETE",
-                    {
-                        "current_utc": frame.attrs["current_utc"],
-                        "candle_open": candle_time.isoformat(),
-                        "candle_close": candle_close.isoformat(),
-                        "mt5_start_pos": frame.attrs["mt5_start_pos"],
-                        "raw_rates_count": frame.attrs["raw_rates_count"],
-                        "filtered_rates_count": frame.attrs["filtered_rates_count"],
-                        "latest_closed_candle": frame.attrs["latest_closed_candle"],
-                        "latest_closed_close_time": frame.attrs[
-                            "latest_closed_close_time"
-                        ],
-                        "action": signal.action,
-                        "entry_price": signal.entry_price,
-                        "stop_loss": signal.stop_loss,
-                        "take_profit": signal.take_profit,
-                        "risk_reward": signal.risk_reward,
-                        "market_trend": signal.market_trend,
-                        "market_condition": signal.market_condition,
-                        "buy_setup_score": signal.buy_setup_score,
-                        "sell_setup_score": signal.sell_setup_score,
-                        "local_buy_score": signal.local_buy_score,
-                        "local_sell_score": signal.local_sell_score,
-                        "local_score_breakdown": signal.local_score_breakdown,
-                        "rationale": signal.rationale,
-                        "rejection_reasons": signal.rejection_reasons,
-                        "execution_status": execution_status,
-                        "error": signal.diagnostic or "",
-                    },
-                )
-                last_processed = candle_time
-            else:
-                print(f"No new closed candle: {candle_time.isoformat()}")
-                _write_monitor_log(
-                    log_path,
-                    symbol,
-                    "heartbeat",
-                    "NO_NEW_CANDLE",
-                    {
-                        "current_utc": datetime.now(timezone.utc).isoformat(),
-                        "candle_open": candle_time.isoformat(),
-                    },
-                )
-        except TimestampValidationError as exc:
-            current_utc = datetime.now(timezone.utc).isoformat()
-            print(f"Current UTC: {current_utc}")
-            print(f"Provider timestamp: {_safe_log(str(exc))}")
-            print("Candle open time: unavailable")
-            print("Candle close time: unavailable")
-            print("Last closed candle: unavailable")
-            print("Latest available candle: unavailable")
-            print("Timestamp validation: FAILED")
-            print(f"Future candle detected: {'future' in str(exc).lower()}")
-            print(f"Signal generation status: DATA_ERROR ({exc})")
-            _write_monitor_log(
-                log_path,
-                symbol,
-                "timestamp_validation",
-                "DATA_ERROR",
-                {
-                    "current_utc": current_utc,
-                    "provider_timestamp": str(exc),
-                    "error": str(exc),
-                },
-            )
-        except Exception as exc:
-            print(f"MONITOR_ERROR: {type(exc).__name__}: {exc}")
-            _write_monitor_log(
-                log_path,
-                symbol,
-                "monitor",
-                "ERROR",
-                {"error": f"{type(exc).__name__}: {exc}"},
-            )
-        if once:
-            return
-        time.sleep(interval_seconds)
+                    candle = frame.index[-1].isoformat()
+                    state.begin_candle(candle)
+
+                    if candle == state.processed_candle:
+                        journal.write("idle", candle=candle, processed=True)
+                        log_monitor(
+                            config,
+                            "heartbeat",
+                            "NO_NEW_CANDLE",
+                            {
+                                "current_utc": datetime.now(timezone.utc).isoformat(),
+                                "candle_open": candle,
+                                "latest_closed_candle": candle,
+                            },
+                        )
+                    elif state.signal_attempts >= config.monitor.max_signal_attempts:
+                        journal.write(
+                            "abandoned",
+                            candle=candle,
+                            attempts=state.signal_attempts,
+                        )
+                        state.finish_candle(candle)
+                    else:
+                        state.signal_attempts += 1
+                        store.save(state)
+                        action_for_attempt = (
+                            forced_action if not forced_test_used else None
+                        )
+                        if action_for_attempt is not None:
+                            forced_test_used = True
+                        process_candle(
+                            terminal,
+                            config,
+                            journal,
+                            state,
+                            frame,
+                            execute,
+                            action_for_attempt,
+                        )
+                    failures = 0
+                except (TimestampValidationError, ExecutionError) as exc:
+                    failures += 1
+                    journal.write(
+                        "error",
+                        stage="loop",
+                        error=type(exc).__name__,
+                        detail=str(exc),
+                    )
+                    log_monitor(
+                        config,
+                        "loop",
+                        "ERROR",
+                        {"current_utc": datetime.now(timezone.utc).isoformat(),
+                         "error": f"{type(exc).__name__}: {exc}"},
+                    )
+                except Exception as exc:  # noqa: BLE001 - the loop must survive
+                    failures += 1
+                    journal.write(
+                        "error",
+                        stage="loop",
+                        error=type(exc).__name__,
+                        detail=str(exc),
+                    )
+                    log_monitor(
+                        config,
+                        "loop",
+                        "ERROR",
+                        {"current_utc": datetime.now(timezone.utc).isoformat(),
+                         "error": f"{type(exc).__name__}: {exc}"},
+                    )
+                store.save(state)
+
+                if once:
+                    break
+                delay = config.monitor.poll_seconds
+                if failures:
+                    delay = min(
+                        delay * (2**failures), config.monitor.max_backoff_seconds
+                    )
+                time.sleep(delay)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Continuous guarded XAUUSD Demo monitor")
-    parser.add_argument("--symbol", default="XAUUSD")
-    parser.add_argument("--interval", type=int, default=300)
-    parser.add_argument("--once", action="store_true")
-    parser.add_argument("--log-path", default=r"logs\monitoring.csv")
-    args = parser.parse_args()
-    if args.interval < 60:
-        raise SystemExit("--interval must be at least 60 seconds")
-    run_monitor(args.symbol, args.interval, args.once, args.log_path)
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Continuous guarded XAUUSD demo monitor")
+    parser.add_argument("--config", default=str(DEFAULT_PATH))
+    parser.add_argument("--once", action="store_true", help="process one candle and exit")
+    parser.add_argument("--dry-run", action="store_true", help="never send orders")
+    args = parser.parse_args(argv)
+
+    try:
+        config = load_config(args.config)
+        run(config, once=args.once, dry_run=args.dry_run)
+    except KeyboardInterrupt:
+        print("Stopped by user.")
+    except Exception as exc:  # noqa: BLE001 - surface a clean message
+        print(f"FATAL: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

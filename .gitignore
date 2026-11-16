@@ -17,3 +17,7 @@ logs/*
 *.db
 *.sqlite
 *.sqlite3
+
+# Office documents and their lock files are not source code.
+*.docx
+~$*

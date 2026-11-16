@@ -1,0 +1,52 @@
+# Runtime settings for the guarded demo bot. Nothing here enables live trading:
+# trading/mt5_demo.py refuses any account that is not a demo account.
+account:
+  # Exact Market Watch symbol name. Confirm it with:
+  #   python -m trading.preflight
+  symbol: XAUUSD
+  # Candle timeframe used for signals: M5, M15, M30, H1.
+  timeframe: M5
+
+execution:
+  magic: 26001
+  # Fraction of account balance risked per trade (0.005 = 0.5%).
+  risk_per_trade: 0.005
+  # Stop opening new trades once this fraction of balance is lost in one UTC day.
+  max_daily_loss: 0.02
+  max_trades_per_day: 3
+  max_open_positions: 1
+  # Skip entries while the spread is wider than this many points.
+  max_spread_points: 60
+  # Reject signals whose reward:risk is below this. The model itself must
+  # propose at least 1:2, this is the floor after live-price drift.
+  min_reward_risk: 1.5
+  deviation_points: 20
+  # Hard cap on lot size, independent of the risk-based calculation.
+  max_volume: 1.0
+  # "risk" sizes each trade from order_calc_profit so the loss at the stop is
+  # risk_per_trade of balance. "fixed" always sends fixed_volume lots and only
+  # checks that the resulting loss stays under the risk limit.
+  volume_mode: risk
+  fixed_volume: 0.02
+  # Optional absolute loss cap per trade in account currency (null = only the
+  # risk fraction above applies).
+  max_risk_amount: null
+  # Ambiguous submissions are persisted here so a restart never resends them.
+  pending_state_path: logs/pending_executions.sqlite3
+  pending_timeout_seconds: 300
+  # null lets the bot pick IOC or FOK from the symbol's supported modes.
+  filling_mode: null
+
+monitor:
+  bars: 500
+  poll_seconds: 60
+  # Give up on a candle after this many model attempts (protects API spend).
+  max_signal_attempts: 2
+  # Doubling backoff after an error, capped here.
+  max_backoff_seconds: 600
+  # Append-only diagnostics (separate from the JSONL decision journal).
+  csv_log: logs/monitoring.csv
+
+model:
+  name: openai/gpt-oss-20b
+  context_bars: 100

@@ -34,6 +34,8 @@ def validate_closed_candles(
     """Validate ordering, uniqueness, UTC, and candle closure without filtering."""
     if current_utc.tzinfo is None:
         raise TimestampValidationError("current_utc must be timezone-aware")
+    if timeframe_minutes <= 0:
+        raise TimestampValidationError("timeframe_minutes must be positive")
     current_utc = current_utc.astimezone(timezone.utc)
     if "timestamp" in frame.columns:
         parsed_without_conversion = pd.to_datetime(frame["timestamp"], errors="coerce")
@@ -76,10 +78,17 @@ def select_closed_m5_candles(
     rates: object,
     current_utc: datetime,
     minimum_count: int = 20,
+    timeframe_minutes: int = 5,
 ) -> pd.DataFrame:
-    """Normalize MT5 rates and pass only fully closed M5 candles downstream."""
+    """Normalize MT5 rates and pass only fully closed candles downstream.
+
+    ``timeframe_minutes`` defaults to M5 for backwards compatibility, but the
+    same selector is used for every timeframe the daemon supports.
+    """
     if current_utc.tzinfo is None:
         raise TimestampValidationError("current_utc must be timezone-aware")
+    if timeframe_minutes <= 0:
+        raise TimestampValidationError("timeframe_minutes must be positive")
     frame = pd.DataFrame(rates)
     if frame.empty or "time" not in frame.columns:
         raise TimestampValidationError("MT5 returned no usable candle data")
@@ -90,22 +99,24 @@ def select_closed_m5_candles(
     if not raw_times.is_monotonic_increasing:
         raise TimestampValidationError("raw MT5 candle timestamps are out of order")
     frame["timestamp"] = raw_times
-    close_times = raw_times + pd.Timedelta(5, unit="min")
+    close_times = raw_times + timedelta(minutes=timeframe_minutes)
     current_timestamp = pd.Timestamp(current_utc.astimezone(timezone.utc))
     closed_mask = close_times <= current_timestamp
     filtered = frame.loc[closed_mask].drop(columns=["time"])
     if len(filtered) < minimum_count:
         raise TimestampValidationError(
-            f"insufficient closed M5 candles: raw_count={raw_count} "
+            f"insufficient closed candles: raw_count={raw_count} "
             f"filtered_count={len(filtered)}"
         )
-    result = validate_closed_candles(filtered, current_utc)
+    result = validate_closed_candles(
+        filtered, current_utc, timeframe_minutes=timeframe_minutes
+    )
     result.attrs["raw_rates_count"] = raw_count
     result.attrs["filtered_rates_count"] = len(result)
     result.attrs["raw_latest_candle"] = raw_times[-1].isoformat()
     result.attrs["latest_closed_candle"] = result.index[-1].isoformat()
     result.attrs["latest_closed_close_time"] = (
-        result.index[-1] + pd.Timedelta(5, unit="min")
+        result.index[-1] + timedelta(minutes=timeframe_minutes)
     ).isoformat()
     result.attrs["current_utc"] = current_timestamp.isoformat()
     return result
@@ -118,7 +129,7 @@ def detect_missing_candles(
     """Report gaps without treating normal market closures as invalid candles."""
     if len(frame.index) < 2:
         return []
-    expected = pd.Timedelta(timeframe_minutes, unit="min")
+    expected = timedelta(minutes=timeframe_minutes)
     timestamps = pd.DatetimeIndex(frame.index).sort_values()
     gaps: list[tuple[pd.Timestamp, pd.Timestamp]] = []
     for previous, current in zip(timestamps[:-1], timestamps[1:]):

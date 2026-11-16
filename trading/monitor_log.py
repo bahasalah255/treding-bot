@@ -49,6 +49,7 @@ def append_monitor_log(
     event: str,
     status: str,
     values: dict[str, Any] | None = None,
+    timeframe: str = "M5",
 ) -> None:
     """Append one structured monitor event without affecting trading decisions."""
     target = Path(path)
@@ -62,7 +63,7 @@ def append_monitor_log(
     row.update(values or {})
     row["event_time_utc"] = datetime.now(timezone.utc).isoformat()
     row["symbol"] = symbol
-    row["timeframe"] = "M5"
+    row["timeframe"] = timeframe
     row["event"] = event
     row["status"] = status
     with target.open("a", newline="", encoding="utf-8-sig") as handle:
