@@ -172,3 +172,24 @@ def test_apply_local_levels_rounds_to_symbol_precision():
         assert value == round(value, 2)
     assert adjusted.stop_loss < adjusted.entry_price < adjusted.take_profit
     assert adjusted.risk_reward == 2.0
+
+
+def test_run_once_delegates_to_the_guarded_daemon(monkeypatch):
+    """The legacy entry point must not bypass the gate or the freshness guard."""
+    from trading import run_once
+
+    captured: dict[str, list[str]] = {}
+
+    def fake_main(argv):
+        captured["argv"] = list(argv)
+        return 0
+
+    monkeypatch.setattr(run_once.daemon, "main", fake_main)
+
+    assert run_once.main([]) == 0
+    assert "--once" in captured["argv"]
+    assert "--dry-run" in captured["argv"]
+
+    assert run_once.main(["--execute"]) == 0
+    assert "--once" in captured["argv"]
+    assert "--dry-run" not in captured["argv"]
