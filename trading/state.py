@@ -20,6 +20,11 @@ class RuntimeState:
     day: str | None = None
     trades_today: int = 0
     last_deal_ticket: int = 0
+    daily_loss_usd: float = 0.0
+    total_loss_usd: float = 0.0
+    consecutive_losses: int = 0
+    kill_switch: bool = False
+    entered_candle: str | None = None
 
     def roll_day(self, today: str) -> bool:
         """Reset the daily counters when the UTC date changes."""
@@ -27,6 +32,8 @@ class RuntimeState:
             return False
         self.day = today
         self.trades_today = 0
+        self.daily_loss_usd = 0.0
+        self.consecutive_losses = 0
         return True
 
     def record_trade(self) -> None:

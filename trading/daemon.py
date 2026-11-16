@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,12 @@ import pandas as pd
 from data.timestamp_validation import TimestampValidationError, select_closed_m5_candles
 from trading.config import DEFAULT_PATH, DemoConfig, TIMEFRAMES, load_config
 from trading.groq_signal import Signal
+from trading.gate_config import (
+    GateAccountState,
+    GateMarketState,
+    evaluate_entry_gate,
+    log_gate_result,
+)
 from trading.journal import Journal
 from trading.monitor_log import append_monitor_log
 from trading.state import StateStore, RuntimeState, single_instance
@@ -59,10 +66,57 @@ def forced_test_signal(terminal: Any, symbol: str, action: str) -> Signal:
         2.2,
         "FORCED_TEST",
         "FORCED_TEST",
-        0.0,
-        0.0,
+        100.0 if action == "BUY" else 0.0,
+        0.0 if action == "BUY" else 100.0,
         "FORCED TEST TRADE",
         (),
+    )
+
+
+def atr14(frame: pd.DataFrame) -> float:
+    """Calculate ATR(14) from closed M5 candles only."""
+    previous_close = frame["close"].shift(1)
+    true_range = pd.concat(
+        [
+            frame["high"] - frame["low"],
+            (frame["high"] - previous_close).abs(),
+            (frame["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    value = float(true_range.rolling(14).mean().iloc[-1])
+    if not pd.notna(value) or value <= 0:
+        raise ValueError("ATR(14) is unavailable or non-positive")
+    return value
+
+
+def seconds_until_next_candle(minutes: int, now: datetime | None = None) -> float:
+    """Return the delay until the next UTC candle boundary."""
+    current = now or datetime.now(timezone.utc)
+    elapsed = current.minute % minutes
+    boundary = current.replace(
+        minute=current.minute - elapsed,
+        second=0,
+        microsecond=0,
+    ) + timedelta(minutes=minutes)
+    return max(0.1, (boundary - current).total_seconds())
+
+
+def apply_local_levels(signal: Signal, frame: pd.DataFrame, config: DemoConfig) -> Signal:
+    """Replace model levels with local ATR-based levels before gating."""
+    if signal.action not in {"BUY", "SELL"} or signal.entry_price is None:
+        return signal
+    risk = config.gate.sl_atr_mult * atr14(frame)
+    entry = float(signal.entry_price)
+    if signal.action == "BUY":
+        stop_loss, take_profit = entry - risk, entry + risk * config.gate.min_rr
+    else:
+        stop_loss, take_profit = entry + risk, entry - risk * config.gate.min_rr
+    return replace(
+        signal,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        risk_reward=config.gate.min_rr,
     )
 
 
@@ -126,6 +180,16 @@ def journal_new_deals(
     from trading.mt5_demo import new_deals
 
     for deal in new_deals(terminal, config.execution.magic, state.last_deal_ticket):
+        net = float(getattr(deal, "profit", 0.0)) + float(
+            getattr(deal, "commission", 0.0)
+        ) + float(getattr(deal, "swap", 0.0))
+        if net < 0:
+            loss = abs(net)
+            state.daily_loss_usd += loss
+            state.total_loss_usd += loss
+            state.consecutive_losses += 1
+        elif net > 0:
+            state.consecutive_losses = 0
         journal.write(
             "deal",
             ticket=int(deal.ticket),
@@ -137,6 +201,7 @@ def journal_new_deals(
             profit=float(getattr(deal, "profit", 0.0)),
             commission=float(getattr(deal, "commission", 0.0)),
             swap=float(getattr(deal, "swap", 0.0)),
+            net=net,
             deal_time=datetime.fromtimestamp(
                 int(deal.time), tz=timezone.utc
             ).isoformat(),
@@ -189,6 +254,81 @@ def process_candle(
         )
         return
 
+    if signal.action in {"NO_TRADE", "DATA_ERROR"}:
+        journal.write(
+            "signal",
+            candle=candle,
+            action=signal.action,
+            rationale=signal.rationale,
+            rejection_reasons=list(signal.rejection_reasons),
+        )
+        log_monitor(
+            config,
+            "signal",
+            "COMPLETE",
+            {
+                "current_utc": datetime.now(timezone.utc).isoformat(),
+                "candle_open": candle,
+                "candle_close": close_time,
+                "action": signal.action,
+                "rationale": signal.rationale,
+                "rejection_reasons": signal.rejection_reasons,
+                "error": signal.diagnostic or "",
+            },
+        )
+        state.finish_candle(candle)
+        return
+
+    try:
+        tick = terminal.symbol_info_tick(config.account.symbol)
+        if tick is None:
+            raise RuntimeError(f"unable to read tick: {terminal.last_error()}")
+        entry = float(tick.ask if signal.action == "BUY" else tick.bid)
+        signal = apply_local_levels(
+            replace(signal, entry_price=entry), frame, config
+        )
+        info = terminal.symbol_info(config.account.symbol)
+        spread = float(tick.ask) - float(tick.bid)
+        from trading.mt5_demo import open_positions
+
+        positions = open_positions(terminal, config.account.symbol, config.execution.magic)
+        local_direction = (
+            "BUY" if signal.local_buy_score > signal.local_sell_score else "SELL"
+        )
+        gate = evaluate_entry_gate(
+            signal,
+            GateMarketState(
+                spread=spread,
+                utc_now=datetime.now(timezone.utc),
+                candle_id=candle,
+                local_direction=local_direction,
+            ),
+            GateAccountState(
+                daily_loss_usd=state.daily_loss_usd,
+                consecutive_losses=state.consecutive_losses,
+                trades_today=state.trades_today,
+                total_loss_usd=state.total_loss_usd,
+                open_positions=len(positions),
+                entered_candle=state.entered_candle,
+                kill_switch=state.kill_switch,
+            ),
+            config.gate,
+        )
+        log_gate_result(gate)
+        if not gate.passed:
+            journal.write("entry_blocked", candle=candle, reason="; ".join(gate.failed_rules))
+            log_monitor(
+                config, "gate", "REJECTED",
+                {"candle_open": candle, "reasons": "; ".join(gate.failed_rules)},
+            )
+            state.finish_candle(candle)
+            return
+        state.entered_candle = candle
+    except (RuntimeError, ValueError) as exc:
+        journal.write("entry_blocked", candle=candle, reason=str(exc))
+        state.finish_candle(candle)
+        return
+
     journal.write(
         "signal",
         candle=candle,
@@ -209,36 +349,6 @@ def process_candle(
         diagnostic=signal.diagnostic,
         timeframe=config.account.timeframe,
     )
-    if signal.action in {"NO_TRADE", "DATA_ERROR"}:
-        log_monitor(
-            config,
-            "signal",
-            "COMPLETE",
-            {
-                "current_utc": datetime.now(timezone.utc).isoformat(),
-                "candle_open": candle,
-                "candle_close": close_time,
-                "latest_closed_candle": candle,
-                "action": signal.action,
-                "entry_price": signal.entry_price,
-                "stop_loss": signal.stop_loss,
-                "take_profit": signal.take_profit,
-                "risk_reward": signal.risk_reward,
-                "market_trend": signal.market_trend,
-                "market_condition": signal.market_condition,
-                "buy_setup_score": signal.buy_setup_score,
-                "sell_setup_score": signal.sell_setup_score,
-                "local_buy_score": signal.local_buy_score,
-                "local_sell_score": signal.local_sell_score,
-                "local_score_breakdown": signal.local_score_breakdown,
-                "rationale": signal.rationale,
-                "rejection_reasons": signal.rejection_reasons,
-                "error": signal.diagnostic or "",
-            },
-        )
-        state.finish_candle(candle)
-        return
-
     try:
         result = submit_signal(signal, config, journal, state, terminal, execute=execute)
     except ExecutionError as exc:
@@ -296,6 +406,10 @@ def run(
         with session() as terminal:
             # Refuse a live account before doing anything else, even in dry run.
             account = require_demo_account(terminal, require_expert=execute)
+            demo_mode = int(getattr(terminal, "ACCOUNT_TRADE_MODE_DEMO", 0))
+            if account.trade_mode != demo_mode and forced_action is not None:
+                LOGGER.warning("FORCE_TEST_TRADE disabled for live account")
+                forced_action = None
             journal.write(
                 "startup",
                 symbol=config.account.symbol,
@@ -328,6 +442,22 @@ def run(
                     if state.roll_day(today):
                         store.save(state)
                     journal_new_deals(terminal, config, journal, state)
+                    if state.kill_switch:
+                        LOGGER.error("KILL SWITCH remains active; manual reset required")
+                        break
+                    if state.total_loss_usd >= config.gate.max_total_loss_usd:
+                        state.kill_switch = True
+                        journal.write(
+                            "kill_switch",
+                            reason="max_total_loss_usd",
+                            total_loss_usd=state.total_loss_usd,
+                        )
+                        store.save(state)
+                        LOGGER.error(
+                            "KILL SWITCH active: total_loss_usd=%.2f",
+                            state.total_loss_usd,
+                        )
+                        break
 
                     reconciliation = reconcile_pending(terminal, config, journal)
                     if reconciliation:
@@ -413,11 +543,11 @@ def run(
 
                 if once:
                     break
-                delay = config.monitor.poll_seconds
+                delay = seconds_until_next_candle(
+                    timeframe_minutes(config.account.timeframe)
+                )
                 if failures:
-                    delay = min(
-                        delay * (2**failures), config.monitor.max_backoff_seconds
-                    )
+                    delay = min(delay * (2**failures), config.monitor.max_backoff_seconds)
                 time.sleep(delay)
 
 

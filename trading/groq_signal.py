@@ -27,7 +27,6 @@ DEFAULT_MODEL = "openai/gpt-oss-20b"
 MIN_ANALYSIS_CANDLES = 60
 SWING_LEFT = 2
 SWING_RIGHT = 2
-MIN_RISK_REWARD = 2.0
 RR_REL_TOLERANCE = 0.01
 RR_ABS_TOLERANCE = 0.01
 
@@ -492,8 +491,8 @@ def _validate_setup(
         return "SELL requires take_profit < entry < stop_loss"
     risk = abs(entry - stop_loss)
     reward = abs(take_profit - entry)
-    if risk <= 0 or reward <= 0 or reward / risk < MIN_RISK_REWARD:
-        return "trade failed directional or minimum 1:2 risk-reward validation"
+    if risk <= 0 or reward <= 0:
+        return "trade failed directional risk-reward validation"
     atr = float(evidence["atr14"])
     support = float(evidence["support"])
     resistance = float(evidence["resistance"])

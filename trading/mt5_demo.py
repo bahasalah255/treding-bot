@@ -138,11 +138,19 @@ def require_demo_account(
             f"unable to read account information: {module.last_error()}"
         )
     demo_mode = getattr(module, "ACCOUNT_TRADE_MODE_DEMO", 0)
-    if int(getattr(account, "trade_mode", -1)) != int(demo_mode):
-        raise ExecutionError(
-            f"refusing to trade account {getattr(account, 'login', '?')}: "
-            f"trade_mode {getattr(account, 'trade_mode', '?')} is not a demo account"
-        )
+    trade_mode = int(getattr(account, "trade_mode", -1))
+    login = int(getattr(account, "login", 0))
+    if trade_mode != int(demo_mode):
+        allowed = {
+            int(value.strip())
+            for value in os.environ.get("LIVE_ALLOWED_ACCOUNTS", "").split(",")
+            if value.strip().isdigit()
+        }
+        if os.environ.get("ENABLE_LIVE_TRADING") != "1" or login not in allowed:
+            raise ExecutionError(
+                f"refusing account {login}: not a demo account; live trading requires "
+                "ENABLE_LIVE_TRADING=1 and LIVE_ALLOWED_ACCOUNTS"
+            )
     if require_expert and not bool(getattr(account, "trade_expert", True)):
         raise ExecutionError(
             "algo trading is disabled for this account; enable Algo Trading in the terminal"
@@ -153,7 +161,7 @@ def require_demo_account(
         currency=str(getattr(account, "currency", "")),
         balance=float(getattr(account, "balance", 0.0)),
         equity=float(getattr(account, "equity", 0.0)),
-        trade_mode=int(getattr(account, "trade_mode", -1)),
+        trade_mode=trade_mode,
         trade_expert=bool(getattr(account, "trade_expert", True)),
         leverage=int(getattr(account, "leverage", 0)),
     )
@@ -734,10 +742,10 @@ def submit_signal(
     entry = float(tick.ask if signal.action == "BUY" else tick.bid)
     limits = Limits(
         max_spread_points=execution.max_spread_points,
-        max_trades_per_day=execution.max_trades_per_day,
+        max_trades_per_day=config.gate.max_trades_per_day,
         max_daily_loss_fraction=execution.max_daily_loss,
         max_open_positions=execution.max_open_positions,
-        min_reward_risk=execution.min_reward_risk,
+        min_reward_risk=config.gate.min_rr,
     )
     positions = open_positions(module, symbol, execution.magic)
     spread = (float(tick.ask) - float(tick.bid)) / spec.point if spec.point > 0 else 0.0
@@ -764,7 +772,7 @@ def submit_signal(
         )
         if reason is None:
             if execution.volume_mode == "fixed":
-                volume = execution.fixed_volume
+                volume = config.gate.fixed_volume
                 volume_error = validate_fixed_volume(info, volume)
                 if volume_error:
                     reason = volume_error
@@ -1059,5 +1067,8 @@ def submit_signal(
 
 
 def is_live_trading_enabled() -> bool:
-    """The second safety switch, on top of the demo-account check."""
-    return os.environ.get("ENABLE_DEMO_TRADING") == "1"
+    """Return whether an explicitly enabled demo or allow-listed live run may trade."""
+    return (
+        os.environ.get("ENABLE_DEMO_TRADING") == "1"
+        or os.environ.get("ENABLE_LIVE_TRADING") == "1"
+    )

@@ -106,7 +106,7 @@ def test_swings_are_only_exposed_after_right_confirmation_candles():
         assert pd.Timestamp(pivot["confirmation_timestamp"]) < latest
 
 
-def test_validate_setup_rejects_rr_below_two():
+def test_validate_setup_leaves_minimum_rr_to_entry_gate():
     evidence = {
         "atr14": 1.0, "support": 90.0, "resistance": 120.0,
         "latest_close": 100.0, "range": {"middle": False},
@@ -115,7 +115,7 @@ def test_validate_setup_rejects_rr_below_two():
             "bullish": {"confirmed": False}, "bearish": {"confirmed": False}
         },
     }
-    assert "1:2" in _validate_setup("SELL", 100, 110, 97, evidence)
+    assert _validate_setup("SELL", 100, 110, 97, evidence) is None
 
 
 def test_request_signal_rejects_missing_groq_scores(monkeypatch):
@@ -280,7 +280,7 @@ def test_local_rejection_preserves_groq_rejection_reasons(monkeypatch):
     signal = request_signal(_frame())
     assert signal.action == "NO_TRADE"
     assert signal.rejection_reasons[0] == "target lacks confirmation"
-    assert "1:2" in signal.rejection_reasons[-1]
+    assert "entry is too far" in signal.rejection_reasons[-1]
 
 
 @pytest.mark.parametrize(

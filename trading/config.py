@@ -8,6 +8,8 @@ from typing import Any
 
 import yaml
 
+from trading.gate_config import GateConfig
+
 DEFAULT_PATH = Path(__file__).resolve().parents[1] / "config" / "demo.yaml"
 FILLING_MODES = {"ioc", "fok", "return"}
 VOLUME_MODES = {"risk", "fixed"}
@@ -33,12 +35,11 @@ class ExecutionConfig:
     max_trades_per_day: int
     max_open_positions: int
     max_spread_points: float
-    min_reward_risk: float
     deviation_points: int
     filling_mode: str | None
     max_volume: float
-    volume_mode: str = "risk"
-    fixed_volume: float = 0.02
+    volume_mode: str = "fixed"
+    fixed_volume: float = 0.01
     max_risk_amount: float | None = None
     pending_state_path: str = "logs/pending_executions.sqlite3"
     pending_timeout_seconds: int = 300
@@ -62,6 +63,7 @@ class ModelConfig:
 @dataclass(frozen=True)
 class DemoConfig:
     account: AccountConfig
+    gate: GateConfig
     execution: ExecutionConfig
     monitor: MonitorConfig
     model: ModelConfig
@@ -93,6 +95,31 @@ def _fraction(section: dict[str, Any], name: str, where: str, upper: float) -> f
     if not 0 < value <= upper:
         raise ConfigError(f"{where}.{name} must be between 0 and {upper}")
     return value
+
+
+def _gate_config(config: dict[str, Any]) -> GateConfig:
+    section = config.get("gate", {})
+    if not isinstance(section, dict):
+        raise ConfigError("config section 'gate' must be a mapping")
+    defaults = GateConfig()
+    values = {name: section.get(name, getattr(defaults, name))
+              for name in defaults.__dataclass_fields__}
+    try:
+        gate = GateConfig(**values)
+        gate.session_bounds()
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"invalid gate configuration: {exc}") from exc
+    if gate.min_score < 0 or gate.min_score_gap < 0 or gate.sl_atr_mult <= 0:
+        raise ConfigError("gate score thresholds and sl_atr_mult must be non-negative")
+    if gate.min_rr <= 0 or gate.fixed_volume <= 0:
+        raise ConfigError("gate min_rr and fixed_volume must be positive")
+    if gate.max_daily_loss_usd <= 0 or gate.max_total_loss_usd <= 0:
+        raise ConfigError("gate loss limits must be positive")
+    if gate.max_consecutive_losses < 0 or gate.max_trades_per_day < 0:
+        raise ConfigError("gate trade limits must be non-negative")
+    if gate.max_spread < 0:
+        raise ConfigError("gate.max_spread must be non-negative")
+    return gate
 
 
 def parse_config(config: dict[str, Any]) -> DemoConfig:
@@ -176,6 +203,7 @@ def parse_config(config: dict[str, Any]) -> DemoConfig:
 
     return DemoConfig(
         account=AccountConfig(symbol=symbol.strip(), timeframe=timeframe),
+        gate=_gate_config(config),
         execution=ExecutionConfig(
             magic=magic,
             risk_fraction=_fraction(execution, "risk_per_trade", "execution", 0.05),
@@ -183,7 +211,6 @@ def parse_config(config: dict[str, Any]) -> DemoConfig:
             max_trades_per_day=_integer(execution, "max_trades_per_day", "execution"),
             max_open_positions=_integer(execution, "max_open_positions", "execution"),
             max_spread_points=_number(execution, "max_spread_points", "execution"),
-            min_reward_risk=_number(execution, "min_reward_risk", "execution"),
             deviation_points=_integer(execution, "deviation_points", "execution"),
             filling_mode=filling_mode,
             max_volume=max_volume,

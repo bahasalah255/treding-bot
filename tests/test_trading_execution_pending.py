@@ -254,7 +254,7 @@ def test_fixed_volume_mode_sends_the_exact_configured_volume(tmp_path):
     )
 
     assert result.status == "filled"
-    assert terminal.sent[0]["volume"] == pytest.approx(0.02)
+    assert terminal.sent[0]["volume"] == pytest.approx(0.01)
 
 
 def test_fixed_volume_risk_limit_blocks_the_order(tmp_path):

@@ -17,17 +17,12 @@ execution:
   max_open_positions: 1
   # Skip entries while the spread is wider than this many points.
   max_spread_points: 60
-  # Reject signals whose reward:risk is below this. The model itself must
-  # propose at least 1:2, this is the floor after live-price drift.
-  min_reward_risk: 1.5
   deviation_points: 20
   # Hard cap on lot size, independent of the risk-based calculation.
   max_volume: 1.0
-  # "risk" sizes each trade from order_calc_profit so the loss at the stop is
-  # risk_per_trade of balance. "fixed" always sends fixed_volume lots and only
-  # checks that the resulting loss stays under the risk limit.
-  volume_mode: risk
-  fixed_volume: 0.02
+  # Risk sizing is disabled by default; the entry gate owns the fixed volume.
+  volume_mode: fixed
+  fixed_volume: 0.01
   # Optional absolute loss cap per trade in account currency (null = only the
   # risk fraction above applies).
   max_risk_amount: null
@@ -36,6 +31,21 @@ execution:
   pending_timeout_seconds: 300
   # null lets the bot pick IOC or FOK from the symbol's supported modes.
   filling_mode: null
+
+gate:
+  min_score: 70
+  min_score_gap: 30
+  sl_atr_mult: 1.5
+  min_rr: 2.0
+  fixed_volume: 0.01
+  max_daily_loss_usd: 100.0
+  max_consecutive_losses: 2
+  max_trades_per_day: 3
+  max_total_loss_usd: 500.0
+  session_enabled: false
+  session_utc_start: "00:00"
+  session_utc_end: "23:59"
+  max_spread: 0.50
 
 monitor:
   bars: 500
