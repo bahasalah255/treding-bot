@@ -12,6 +12,7 @@ from trading.mt5_demo import (
     reconcile_pending_executions,
 )
 from trading.groq_signal import Signal
+from trading.daemon import _forced_test_signal
 
 
 @pytest.fixture(autouse=True)
@@ -94,6 +95,45 @@ def test_autotrading_disabled_is_blocked(monkeypatch):
     monkeypatch.setattr("trading.mt5_demo.mt5.shutdown", lambda: None)
     result = execute_demo_signal("XAUUSD", signal)
     assert "AutoTrading disabled" in result
+
+
+@pytest.mark.parametrize(
+    ("action", "entry", "stop_loss", "take_profit"),
+    [
+        ("BUY", 100.12, 97.12, 106.72),
+        ("SELL", 99.98, 102.98, 93.38),
+    ],
+)
+def test_forced_test_signal_uses_current_tick_and_rr(
+    monkeypatch, action, entry, stop_loss, take_profit
+):
+    import trading.daemon as daemon
+
+    monkeypatch.setattr(daemon.mt5, "initialize", lambda: True)
+    monkeypatch.setattr(
+        daemon.mt5,
+        "symbol_info",
+        lambda symbol: SimpleNamespace(digits=2),
+    )
+    monkeypatch.setattr(
+        daemon.mt5,
+        "symbol_info_tick",
+        lambda symbol: SimpleNamespace(
+            bid=99.98,
+            ask=100.12,
+        ),
+    )
+    monkeypatch.setattr(daemon.mt5, "symbol_select", lambda symbol, value: True)
+    monkeypatch.setattr(daemon.mt5, "shutdown", lambda: None)
+
+    signal = _forced_test_signal("XAUUSD", action)
+
+    assert signal.action == action
+    assert signal.entry_price == entry
+    assert signal.stop_loss == stop_loss
+    assert signal.take_profit == take_profit
+    assert signal.risk_reward == 2.2
+    assert signal.rationale == "FORCED TEST TRADE"
 
 
 def test_failed_order_check_blocks_order(monkeypatch):

@@ -217,6 +217,15 @@ def _select_filling_mode(symbol_info: Any) -> tuple[int | None, str | None]:
     return None, f"unsupported broker filling mode mask: {supported}"
 
 
+def _retcode_explanation(retcode: int) -> str:
+    return {
+        10027: "AutoTrading disabled",
+        10030: "unsupported or invalid filling mode",
+        10016: "invalid stops",
+        10014: "invalid volume",
+    }.get(retcode, "see MT5 documentation and last_error")
+
+
 def _execution_evidence(symbol: str, result: Any) -> tuple[bool, Any, Any]:
     """Return whether a fill is evidenced, plus position and history evidence."""
     positions = mt5.positions_get(symbol=symbol)
@@ -661,7 +670,11 @@ def execute_demo_signal(symbol: str, signal: Signal) -> str:
                 "tp": signal.take_profit,
                 "deviation": max_deviation,
                 "magic": DEMO_MAGIC,
-                "comment": "groq-demo",
+                "comment": (
+                    "test-bot-demo"
+                    if signal.rationale == "FORCED TEST TRADE"
+                    else "groq-demo"
+                ),
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": filling_mode,
             }
@@ -679,6 +692,16 @@ def execute_demo_signal(symbol: str, signal: Signal) -> str:
             if result is None:
                 LOGGER.error("Execution status=ORDER_REJECTED reason=%s", mt5.last_error())
                 return f"ORDER_REJECTED: {mt5.last_error()}"
+            LOGGER.info(
+                "MT5 order_send result retcode=%s comment=%s order=%s deal=%s "
+                "volume=%s price=%s",
+                getattr(result, "retcode", None),
+                getattr(result, "comment", ""),
+                getattr(result, "order", None),
+                getattr(result, "deal", None),
+                getattr(result, "volume", None),
+                getattr(result, "price", None),
+            )
             done = getattr(mt5, "TRADE_RETCODE_DONE", 10009)
             partial = getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010)
             placed = getattr(mt5, "TRADE_RETCODE_PLACED", 10008)
@@ -704,6 +727,12 @@ def execute_demo_signal(symbol: str, signal: Signal) -> str:
                 )
                 return f"ORDER_SENT: order={getattr(result, 'order', None)} pending execution"
             if result.retcode not in {done, partial}:
+                LOGGER.error(
+                    "MT5 order_send rejected retcode=%s (%s) last_error=%s",
+                    result.retcode,
+                    _retcode_explanation(result.retcode),
+                    mt5.last_error(),
+                )
                 LOGGER.warning(
                     "Execution status=ORDER_REJECTED retcode=%s result=%s",
                     result.retcode,

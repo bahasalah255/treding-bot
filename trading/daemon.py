@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 import time
 from datetime import datetime, timezone
 
@@ -13,9 +15,68 @@ from data.timestamp_validation import (
     TimestampValidationError,
     select_closed_m5_candles,
 )
-from trading.groq_signal import request_signal
+from trading.groq_signal import Signal, request_signal
 from trading.monitor_log import append_monitor_log
 from trading.mt5_demo import execute_demo_signal, reconcile_pending_executions
+
+LOGGER = logging.getLogger(__name__)
+FORCED_TEST_DISTANCE = 3.0
+FORCED_TEST_REWARD = 6.6
+
+
+def _forced_test_signal(symbol: str, action: str) -> Signal:
+    """Build one deterministic test signal from the current Demo tick."""
+    if not mt5.initialize():
+        raise RuntimeError(f"MT5 initialization failed: {mt5.last_error()}")
+    try:
+        info = mt5.symbol_info(symbol)
+        tick = mt5.symbol_info_tick(symbol)
+        if info is None or tick is None:
+            raise RuntimeError(f"unable to read {symbol}: {mt5.last_error()}")
+        if not mt5.symbol_select(symbol, True):
+            raise RuntimeError(f"unable to select {symbol}: {mt5.last_error()}")
+        digits = int(getattr(info, "digits", 0))
+        entry = float(tick.ask if action == "BUY" else tick.bid)
+        if action == "BUY":
+            stop_loss = entry - FORCED_TEST_DISTANCE
+            take_profit = entry + FORCED_TEST_REWARD
+        else:
+            stop_loss = entry + FORCED_TEST_DISTANCE
+            take_profit = entry - FORCED_TEST_REWARD
+        entry = round(entry, digits)
+        stop_loss = round(stop_loss, digits)
+        take_profit = round(take_profit, digits)
+        return Signal(
+            action,
+            entry,
+            stop_loss,
+            take_profit,
+            2.2,
+            "FORCED_TEST",
+            "FORCED_TEST",
+            0.0,
+            0.0,
+            "FORCED TEST TRADE",
+            (),
+        )
+    finally:
+        mt5.shutdown()
+
+
+def _forced_test_error(action: str, error: Exception) -> Signal:
+    return Signal(
+        "DATA_ERROR",
+        None,
+        None,
+        None,
+        None,
+        "UNKNOWN",
+        "INVALID_DATA",
+        0.0,
+        0.0,
+        f"FORCED TEST TRADE failed: {type(error).__name__}: {error}",
+        (f"FORCED TEST TRADE failed: {type(error).__name__}: {error}",),
+    )
 
 
 def fetch_closed_m5(symbol: str, count: int = 500) -> pd.DataFrame:
@@ -66,6 +127,12 @@ def run_monitor(
 ) -> None:
     """Monitor new closed candles until interrupted."""
     last_processed: pd.Timestamp | None = None
+    forced_action = os.environ.get("FORCE_TEST_TRADE", "").strip().upper()
+    forced_test_used = False
+    if forced_action in {"BUY", "SELL"}:
+        message = f"FORCE_TEST_TRADE actif : {forced_action}"
+        LOGGER.warning(message)
+        print(message)
     print(f"Monitoring {symbol} M5 every {interval_seconds} seconds (Demo only).")
     while True:
         try:
@@ -92,13 +159,21 @@ def run_monitor(
                 print(f"Selected candle: {candle_time.isoformat()}")
                 print("Timestamp validation: PASSED")
                 print("Future candle detected: False")
-                signal = request_signal(frame)
+                if forced_action in {"BUY", "SELL"} and not forced_test_used:
+                    forced_test_used = True
+                    try:
+                        signal = _forced_test_signal(symbol, forced_action)
+                    except Exception as exc:
+                        signal = _forced_test_error(forced_action, exc)
+                    print("Signal generation status: FORCED_TEST")
+                else:
+                    signal = request_signal(frame)
+                    print("Signal generation status: COMPLETE")
                 execution_status = reconciliation_status or ""
                 print(
                     f"{datetime.now(timezone.utc).isoformat()} "
                     f"candle={candle_time.isoformat()} signal={_safe_log(signal)}"
                 )
-                print("Signal generation status: COMPLETE")
                 if (
                     signal.action != "NO_TRADE"
                     and not (
